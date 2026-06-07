@@ -6,25 +6,22 @@
 #import <sys/sysctl.h>
 #import <dirent.h>
 #import <stdio.h>
+#import <string.h>
 
 /*
- * AntiDetectDylib v13 - 延迟MSHookFunction
+ * AntiDetectDylib v14 - 优化C函数hook性能
  *
- * v12闪退原因：在dylib constructor中直接调用MSHookFunction
- * 此时CydiaSubstrate可能还没初始化完成，或hook的函数在启动早期被高频调用
+ * v13问题：游戏卡在logo加载阶段
+ * 原因：hook函数中用NSString做字符串匹配太慢，导致游戏的文件IO阻塞
  *
- * v13策略：
- *   - constructor中只做ObjC hook（已验证稳定）
- *   - C函数hook延迟到主线程runloop启动后执行（dispatch_after 1秒）
- *   - 这样所有framework都已初始化，MSHookFunction安全可用
- *   - 易盾检测在选角色后触发，延迟1秒hook完全来得及
- *
- * 额外安全措施：
- *   - hook函数中检查orig指针是否为NULL，防止空指针调用
- *   - 对_dyld_get_image_name不hook（避免递归），改用dladdr即可
+ * v14修复：
+ *   1. C函数hook延迟3秒（等游戏资源加载完）
+ *   2. hook函数内部用纯C字符串操作（strstr/strncmp），不用NSString
+ *   3. 越狱路径检查用前缀快速匹配，避免字符串分配
+ *   4. 只hook必要的函数，减少拦截范围
  */
 
-#pragma mark - CydiaSubstrate MSHookFunction
+#pragma mark - CydiaSubstrate
 
 typedef void (*MSHookFunction_t)(void *symbol, void *replace, void **result);
 static MSHookFunction_t g_MSHookFunction = NULL;
@@ -32,174 +29,118 @@ static MSHookFunction_t g_MSHookFunction = NULL;
 static BOOL load_MSHookFunction() {
     if (g_MSHookFunction) return YES;
     g_MSHookFunction = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
-    if (g_MSHookFunction) {
-        NSLog(@"[AntiDetect] MSHookFunction loaded");
-        return YES;
-    }
-    // 尝试显式加载
+    if (g_MSHookFunction) return YES;
     void *h = dlopen("@executable_path/Frameworks/CydiaSubstrate.framework/CydiaSubstrate", RTLD_LAZY);
     if (!h) h = dlopen("/usr/lib/libsubstrate.dylib", RTLD_LAZY);
     if (h) g_MSHookFunction = (MSHookFunction_t)dlsym(h, "MSHookFunction");
-    if (g_MSHookFunction) {
-        NSLog(@"[AntiDetect] MSHookFunction loaded via dlopen");
-        return YES;
-    }
-    NSLog(@"[AntiDetect] MSHookFunction NOT available");
-    return NO;
+    return (g_MSHookFunction != NULL);
 }
 
-#pragma mark - 配置
+#pragma mark - 越狱路径配置（纯C字符串，高性能）
 
-static NSArray *g_jailbreak_paths = nil;
-static NSArray *g_hidden_keywords = nil;
-static NSArray *g_hidden_dylib_keywords = nil;
+// 越狱路径前缀 - 用纯C字符串避免NSString开销
+static const char *g_jb_prefixes[] = {
+    "/Applications/Cydia.app",
+    "/Applications/Sileo.app",
+    "/Applications/Zebra.app",
+    "/Applications/unc0ver.app",
+    "/Applications/Taurine.app",
+    "/Applications/TrollStore.app",
+    "/Applications/TrollFools.app",
+    "/Library/MobileSubstrate",
+    "/usr/lib/substrate",
+    "/usr/lib/ligerness",
+    "/usr/lib/libhooker",
+    "/etc/apt",
+    "/var/lib/apt",
+    "/var/lib/cydia",
+    "/private/var/lib/cydia",
+    "/private/var/mobile/Library/Cydia",
+    "/.bootstrapped_evas1on",
+    "/.cydia_no_stash",
+    "/.installed_unc0ver",
+    "/var/jb",
+    "/private/var/jb",
+    NULL
+};
 
-static void init_config() {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        g_jailbreak_paths = @[
-            @"/Applications/Cydia.app",
-            @"/Applications/Sileo.app",
-            @"/Applications/Zebra.app",
-            @"/Applications/unc0ver.app",
-            @"/Applications/Taurine.app",
-            @"/Applications/TrollStore.app",
-            @"/Applications/TrollFools.app",
-            @"/Library/MobileSubstrate",
-            @"/usr/lib/substrate",
-            @"/usr/lib/ligerness",
-            @"/usr/lib/libhooker",
-            @"/etc/apt",
-            @"/var/lib/apt",
-            @"/var/lib/cydia",
-            @"/private/var/lib/cydia",
-            @"/private/var/mobile/Library/Cydia",
-            @"/.bootstrapped_evas1on",
-            @"/.cydia_no_stash",
-            @"/.installed_unc0ver",
-            @"/var/jb",
-            @"/private/var/jb",
-        ];
-        g_hidden_keywords = @[
-            @"AntiDetect",
-            @"LIBTOOL",
-            @"CydiaSubstrate",
-            @"TrollFools",
-            @"TrollStore",
-            @"substrate",
-            @"SubstrateLoader",
-            @"MobileSubstrate",
-            @"libhooker",
-        ];
-        g_hidden_dylib_keywords = @[
-            @"CydiaSubstrate",
-            @"SubstrateLoader",
-            @"MobileSubstrate",
-            @"libsubstrate",
-            @"TrollFools",
-            @"TrollStore",
-            @"AntiDetect",
-            @"LIBTOOL",
-            @"libhooker",
-        ];
-    });
-}
+// 越狱路径中包含的关键词（用于dladdr检查）
+static const char *g_hide_keywords[] = {
+    "CydiaSubstrate",
+    "SubstrateLoader",
+    "MobileSubstrate",
+    "TrollFools",
+    "TrollStore",
+    "AntiDetect",
+    "LIBTOOL",
+    "libhooker",
+    "substrate",
+    NULL
+};
 
-static BOOL is_jailbreak_path_c(const char *path) {
+// 纯C函数：检查路径是否为越狱路径
+static BOOL is_jb_path(const char *path) {
     if (!path) return NO;
-    NSString *nsPath = [NSString stringWithUTF8String:path];
-    for (NSString *jp in g_jailbreak_paths) {
-        if ([nsPath hasPrefix:jp]) return YES;
+    for (int i = 0; g_jb_prefixes[i]; i++) {
+        if (strncmp(path, g_jb_prefixes[i], strlen(g_jb_prefixes[i])) == 0)
+            return YES;
     }
     return NO;
 }
 
-static BOOL should_block_ns(NSString *path) {
-    if (!path || path.length == 0) return NO;
-    for (NSString *jp in g_jailbreak_paths) {
-        if ([path hasPrefix:jp]) return YES;
-    }
-    NSString *lower = path.lowercaseString;
-    for (NSString *kw in g_hidden_keywords) {
-        if ([lower containsString:kw.lowercaseString]) return YES;
-    }
-    return NO;
-}
-
-static BOOL should_hide_dylib(const char *name) {
+// 纯C函数：检查dylib名是否要隐藏
+static BOOL should_hide_lib(const char *name) {
     if (!name) return NO;
-    NSString *nsName = [NSString stringWithUTF8String:name].lowercaseString;
-    for (NSString *kw in g_hidden_dylib_keywords) {
-        if ([nsName containsString:kw.lowercaseString]) return YES;
+    for (int i = 0; g_hide_keywords[i]; i++) {
+        if (strstr(name, g_hide_keywords[i]))
+            return YES;
     }
     return NO;
 }
 
-#pragma mark - C函数Hook定义
+#pragma mark - C函数Hook
 
-// --- 文件系统 ---
 static int (*orig_stat)(const char *restrict, struct stat *restrict) = NULL;
 static int (*orig_access)(const char *, int) = NULL;
 static FILE *(*orig_fopen)(const char *, const char *) = NULL;
-static DIR *(*orig_opendir)(const char *) = NULL;
+static int (*orig_dladdr)(const void *, Dl_info *) = NULL;
+static char *(*orig_getenv)(const char *) = NULL;
+static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
 
 static int hook_stat(const char *restrict path, struct stat *restrict buf) {
-    if (!orig_stat) return -1;
-    if (is_jailbreak_path_c(path)) return -1;
+    if (is_jb_path(path)) return -1;
     return orig_stat(path, buf);
 }
 
 static int hook_access(const char *path, int mode) {
-    if (!orig_access) return -1;
-    if (is_jailbreak_path_c(path)) { errno = ENOENT; return -1; }
+    if (is_jb_path(path)) { errno = ENOENT; return -1; }
     return orig_access(path, mode);
 }
 
 static FILE *hook_fopen(const char *path, const char *mode) {
-    if (!orig_fopen) return NULL;
-    if (is_jailbreak_path_c(path)) return NULL;
+    if (is_jb_path(path)) return NULL;
     return orig_fopen(path, mode);
 }
 
-static DIR *hook_opendir(const char *path) {
-    if (!orig_opendir) return NULL;
-    if (is_jailbreak_path_c(path)) return NULL;
-    return orig_opendir(path);
-}
-
-// --- 动态库 ---
-static int (*orig_dladdr)(const void *, Dl_info *) = NULL;
-
 static int hook_dladdr(const void *addr, Dl_info *info) {
-    if (!orig_dladdr) return 0;
     int ret = orig_dladdr(addr, info);
-    if (ret && info && info->dli_fname && should_hide_dylib(info->dli_fname)) {
+    if (ret && info && info->dli_fname && should_hide_lib(info->dli_fname)) {
         memset(info, 0, sizeof(Dl_info));
         return 0;
     }
     return ret;
 }
 
-// --- 环境变量 ---
-static char *(*orig_getenv)(const char *) = NULL;
-
 static char *hook_getenv(const char *name) {
-    if (!orig_getenv) return NULL;
     if (name) {
-        if (strstr(name, "DYLD_") == name) return NULL;
-        if (strstr(name, "MSSafeMode") || strstr(name, "_MSSafeMode") ||
-            strstr(name, "SUBSTRATE_HOME")) return NULL;
+        if (strncmp(name, "DYLD_", 5) == 0) return NULL;
+        if (strstr(name, "MSSafeMode") || strstr(name, "SUBSTRATE_HOME")) return NULL;
     }
     return orig_getenv(name);
 }
 
-// --- sysctl ---
-static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
-
 static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    if (!orig_sysctl) return -1;
     int result = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
-    // 清除P_TRACED标志
     if (namelen == 4 && name[0] == CTL_KERN && name[1] == KERN_PROC &&
         name[2] == KERN_PROC_PID && oldp && oldlenp &&
         *oldlenp >= sizeof(struct kinfo_proc)) {
@@ -208,32 +149,22 @@ static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, vo
     return result;
 }
 
-#pragma mark - 延迟安装C函数Hook
+#pragma mark - 安装C函数Hook
 
-static void install_c_function_hooks() {
-    NSLog(@"[AntiDetect] 开始安装C函数Hook（延迟）...");
-
+static void install_c_hooks() {
     if (!load_MSHookFunction()) {
-        NSLog(@"[AntiDetect] MSHookFunction不可用，跳过C函数hook");
+        NSLog(@"[AntiDetect] MSHookFunction不可用");
         return;
     }
 
-    // 文件系统
     g_MSHookFunction((void *)stat, (void *)hook_stat, (void **)&orig_stat);
     g_MSHookFunction((void *)access, (void *)hook_access, (void **)&orig_access);
     g_MSHookFunction((void *)fopen, (void *)hook_fopen, (void **)&orig_fopen);
-    g_MSHookFunction((void *)opendir, (void *)hook_opendir, (void **)&orig_opendir);
-
-    // 动态库（只hook dladdr，不hook _dyld_image_count/_dyld_get_image_name避免递归）
     g_MSHookFunction((void *)dladdr, (void *)hook_dladdr, (void **)&orig_dladdr);
-
-    // 环境变量
     g_MSHookFunction((void *)getenv, (void *)hook_getenv, (void **)&orig_getenv);
-
-    // sysctl
     g_MSHookFunction((void *)sysctl, (void *)hook_sysctl, (void **)&orig_sysctl);
 
-    NSLog(@"[AntiDetect] C函数Hook安装完成！stat/access/fopen/opendir/dladdr/getenv/sysctl");
+    NSLog(@"[AntiDetect] C函数Hook安装完成 (stat/access/fopen/dladdr/getenv/sysctl)");
 }
 
 #pragma mark - ObjC Hook
@@ -243,6 +174,23 @@ static IMP orig_fileExistsAtPathIsDir_IMP = NULL;
 static IMP orig_contentsOfDirectoryAtPath_IMP = NULL;
 static IMP orig_canOpenURL_IMP = NULL;
 static IMP orig_presentViewController_IMP = NULL;
+
+// ObjC层用的路径检查（NSString）
+static NSArray *g_jb_paths_ns = nil;
+static NSArray *g_hide_kw_ns = nil;
+
+static BOOL should_block_ns(NSString *path) {
+    if (!path || path.length == 0) return NO;
+    if (!g_jb_paths_ns) return NO;
+    for (NSString *jp in g_jb_paths_ns) {
+        if ([path hasPrefix:jp]) return YES;
+    }
+    NSString *lower = path.lowercaseString;
+    for (NSString *kw in g_hide_kw_ns) {
+        if ([lower containsString:kw.lowercaseString]) return YES;
+    }
+    return NO;
+}
 
 static BOOL hooked_fileExistsAtPath(id self, SEL _cmd, NSString *path) {
     if (should_block_ns(path)) return NO;
@@ -281,7 +229,7 @@ static void hooked_presentViewController(id self, SEL _cmd, UIViewController *vc
         UIAlertController *alert = (UIAlertController *)vc;
         NSString *combined = [NSString stringWithFormat:@"%@%@", alert.title ?: @"", alert.message ?: @""];
         if ([combined containsString:@"环境异常"] || [combined containsString:@"800180933"] || [combined containsString:@"QQ公众号"]) {
-            NSLog(@"[AntiDetect] 拦截弹窗: %@ %@", alert.title, alert.message);
+            NSLog(@"[AntiDetect] 拦截弹窗");
             return;
         }
     }
@@ -309,11 +257,39 @@ static void clean_anticheat_defaults() {
 __attribute__((constructor))
 static void AntiDetectInit() {
     @autoreleasepool {
-        init_config();
+        // 初始化ObjC配置
+        g_jb_paths_ns = @[
+            @"/Applications/Cydia.app",
+            @"/Applications/Sileo.app",
+            @"/Applications/Zebra.app",
+            @"/Applications/unc0ver.app",
+            @"/Applications/Taurine.app",
+            @"/Applications/TrollStore.app",
+            @"/Applications/TrollFools.app",
+            @"/Library/MobileSubstrate",
+            @"/usr/lib/substrate",
+            @"/usr/lib/ligerness",
+            @"/usr/lib/libhooker",
+            @"/etc/apt",
+            @"/var/lib/apt",
+            @"/var/lib/cydia",
+            @"/private/var/lib/cydia",
+            @"/private/var/mobile/Library/Cydia",
+            @"/.bootstrapped_evas1on",
+            @"/.cydia_no_stash",
+            @"/.installed_unc0ver",
+            @"/var/jb",
+            @"/private/var/jb",
+        ];
+        g_hide_kw_ns = @[
+            @"AntiDetect", @"LIBTOOL", @"CydiaSubstrate",
+            @"TrollFools", @"TrollStore", @"substrate",
+            @"SubstrateLoader", @"MobileSubstrate", @"libhooker",
+        ];
 
-        NSLog(@"[AntiDetect] v13 初始化...");
+        NSLog(@"[AntiDetect] v14 初始化...");
 
-        // ===== ObjC Hook（constructor中立即执行，已验证稳定）=====
+        // ===== ObjC Hook（立即执行）=====
         Class fmClass = objc_getClass("NSFileManager");
         if (fmClass) {
             Method m1 = class_getInstanceMethod(fmClass, @selector(fileExistsAtPath:));
@@ -338,11 +314,11 @@ static void AntiDetectInit() {
 
         clean_anticheat_defaults();
 
-        // ===== C函数Hook（延迟执行，等runloop启动后）=====
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            install_c_function_hooks();
+        // ===== C函数Hook（延迟3秒，等游戏资源加载完毕）=====
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            install_c_hooks();
         });
 
-        NSLog(@"[AntiDetect] v13 ObjC Hook完成，C函数Hook将在1秒后安装");
+        NSLog(@"[AntiDetect] v14 ObjC Hook完成，C函数Hook将在3秒后安装");
     }
 }
