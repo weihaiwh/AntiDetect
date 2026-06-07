@@ -8,7 +8,7 @@
 /*
  * AntiDetectDylib - iOS 环境检测绕过
  * 已预配置：TrollFools + LIBTOOL + CydiaSubstrate 环境
- * 使用 Facebook fishhook 进行符号 hook
+ * 兼容 iOS 14.0 - 18.x
  * ⚠️ 此 dylib 必须是注入列表中【最后一个】加载的
  */
 
@@ -60,23 +60,43 @@ typedef struct {
     int *index_map;
 } ImageMap;
 
+// 用 dlsym 获取原始函数，不依赖 fishhook 的 rebind
+static uint32_t (*orig_dyld_image_count)(void) = NULL;
+static const char *(*orig_dyld_get_image_name)(uint32_t) = NULL;
+static const struct mach_header *(*orig_dyld_get_image_header)(uint32_t) = NULL;
+static intptr_t (*orig_dyld_get_image_vmaddr_slide)(uint32_t) = NULL;
+static int (*orig_dladdr)(const void *, Dl_info *) = NULL;
+static char *(*orig_getenv)(const char *) = NULL;
+static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
+
+static void load_orig_functions() {
+    orig_dyld_image_count = dlsym(RTLD_DEFAULT, "_dyld_image_count");
+    orig_dyld_get_image_name = dlsym(RTLD_DEFAULT, "_dyld_get_image_name");
+    orig_dyld_get_image_header = dlsym(RTLD_DEFAULT, "_dyld_get_image_header");
+    orig_dyld_get_image_vmaddr_slide = dlsym(RTLD_DEFAULT, "_dyld_get_image_vmaddr_slide");
+    orig_dladdr = dlsym(RTLD_DEFAULT, "dladdr");
+    orig_getenv = dlsym(RTLD_DEFAULT, "getenv");
+    orig_sysctl = dlsym(RTLD_DEFAULT, "sysctl");
+}
+
+// 构建镜像映射表 - 使用原始函数（绕过 hook）
 static ImageMap build_image_map() {
     ImageMap map = {0};
-    int real_count = (int)_dyld_image_count();
-    map.real_count = real_count;
+    uint32_t real_count = orig_dyld_image_count ? orig_dyld_image_count() : _dyld_image_count();
+    map.real_count = (int)real_count;
     BOOL *hidden = (BOOL *)malloc(real_count * sizeof(BOOL));
     memset(hidden, 0, real_count * sizeof(BOOL));
-    for (int i = 0; i < real_count; i++) {
-        const char *name = _dyld_get_image_name(i);
+    for (uint32_t i = 0; i < real_count; i++) {
+        const char *name = orig_dyld_get_image_name ? orig_dyld_get_image_name(i) : _dyld_get_image_name(i);
         if (should_hide_image(name)) hidden[i] = YES;
     }
     map.visible_count = 0;
-    for (int i = 0; i < real_count; i++) {
+    for (int i = 0; i < map.real_count; i++) {
         if (!hidden[i]) map.visible_count++;
     }
     map.index_map = (int *)malloc(map.visible_count * sizeof(int));
     int vis_idx = 0;
-    for (int i = 0; i < real_count; i++) {
+    for (int i = 0; i < map.real_count; i++) {
         if (!hidden[i]) map.index_map[vis_idx++] = i;
     }
     free(hidden);
@@ -89,11 +109,6 @@ static void free_image_map(ImageMap *map) {
 
 #pragma mark - Hook: dyld 镜像枚举
 
-static uint32_t (*orig_dyld_image_count)(void) = NULL;
-static const char *(*orig_dyld_get_image_name)(uint32_t) = NULL;
-static const struct mach_header *(*orig_dyld_get_image_header)(uint32_t) = NULL;
-static intptr_t (*orig_dyld_get_image_vmaddr_slide)(uint32_t) = NULL;
-
 static uint32_t hooked_dyld_image_count() {
     ImageMap map = build_image_map();
     uint32_t count = (uint32_t)map.visible_count;
@@ -104,8 +119,10 @@ static uint32_t hooked_dyld_image_count() {
 static const char *hooked_dyld_get_image_name(uint32_t index) {
     ImageMap map = build_image_map();
     const char *result = NULL;
-    if (index < (uint32_t)map.visible_count)
-        result = _dyld_get_image_name(map.index_map[index]);
+    if (index < (uint32_t)map.visible_count) {
+        uint32_t real_idx = (uint32_t)map.index_map[index];
+        result = orig_dyld_get_image_name ? orig_dyld_get_image_name(real_idx) : _dyld_get_image_name(real_idx);
+    }
     free_image_map(&map);
     return result;
 }
@@ -113,8 +130,10 @@ static const char *hooked_dyld_get_image_name(uint32_t index) {
 static const struct mach_header *hooked_dyld_get_image_header(uint32_t index) {
     ImageMap map = build_image_map();
     const struct mach_header *result = NULL;
-    if (index < (uint32_t)map.visible_count)
-        result = _dyld_get_image_header(map.index_map[index]);
+    if (index < (uint32_t)map.visible_count) {
+        uint32_t real_idx = (uint32_t)map.index_map[index];
+        result = orig_dyld_get_image_header ? orig_dyld_get_image_header(real_idx) : _dyld_get_image_header(real_idx);
+    }
     free_image_map(&map);
     return result;
 }
@@ -122,17 +141,18 @@ static const struct mach_header *hooked_dyld_get_image_header(uint32_t index) {
 static intptr_t hooked_dyld_get_image_vmaddr_slide(uint32_t index) {
     ImageMap map = build_image_map();
     intptr_t result = 0;
-    if (index < (uint32_t)map.visible_count)
-        result = _dyld_get_image_vmaddr_slide(map.index_map[index]);
+    if (index < (uint32_t)map.visible_count) {
+        uint32_t real_idx = (uint32_t)map.index_map[index];
+        result = orig_dyld_get_image_vmaddr_slide ? orig_dyld_get_image_vmaddr_slide(real_idx) : _dyld_get_image_vmaddr_slide(real_idx);
+    }
     free_image_map(&map);
     return result;
 }
 
 #pragma mark - Hook: dladdr
 
-static int (*orig_dladdr)(const void *, Dl_info *) = NULL;
-
 static int hooked_dladdr(const void *addr, Dl_info *info) {
+    if (!orig_dladdr) return dladdr(addr, info);
     int ret = orig_dladdr(addr, info);
     if (ret && info && info->dli_fname && should_hide_image(info->dli_fname)) {
         memset(info, 0, sizeof(Dl_info));
@@ -143,20 +163,16 @@ static int hooked_dladdr(const void *addr, Dl_info *info) {
 
 #pragma mark - Hook: getenv
 
-static char *(*orig_getenv)(const char *) = NULL;
-
 static char *hooked_getenv(const char *name) {
     if (name && (strstr(name, "DYLD_") == name || strstr(name, "MSSafeMode") || strstr(name, "_MSSafeMode") || strstr(name, "SUBSTRATE_HOME")))
         return NULL;
-    return orig_getenv(name);
+    return orig_getenv ? orig_getenv(name) : getenv(name);
 }
 
 #pragma mark - Hook: sysctl
 
-static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
-
 static int hooked_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    int result = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+    int result = orig_sysctl ? orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen) : sysctl(name, namelen, oldp, oldlenp, newp, newlen);
     if (namelen == 4 && name[0] == CTL_KERN && name[1] == KERN_PROC && name[2] == KERN_PROC_PID) {
         if (oldp && oldlenp && *oldlenp >= sizeof(struct kinfo_proc)) {
             struct kinfo_proc *info = (struct kinfo_proc *)oldp;
@@ -169,8 +185,8 @@ static int hooked_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, 
 #pragma mark - Hook: NSFileManager
 
 static NSArray *g_jailbreak_paths = nil;
-static BOOL (*orig_fileExistsAtPath)(id, SEL, NSString *) = NULL;
-static BOOL (*orig_fileExistsAtPathIsDirectory)(id, SEL, NSString *, BOOL *) = NULL;
+static IMP orig_fileExistsAtPath_IMP = NULL;
+static IMP orig_fileExistsAtPathIsDirectory_IMP = NULL;
 
 static BOOL is_jailbreak_path(NSString *path) {
     if (!path) return NO;
@@ -182,12 +198,18 @@ static BOOL is_jailbreak_path(NSString *path) {
 
 static BOOL hooked_fileExistsAtPath(id self, SEL _cmd, NSString *path) {
     if (is_jailbreak_path(path)) return NO;
-    return orig_fileExistsAtPath(self, _cmd, path);
+    if (orig_fileExistsAtPath_IMP) {
+        return ((BOOL(*)(id, SEL, NSString *))orig_fileExistsAtPath_IMP)(self, _cmd, path);
+    }
+    return NO;
 }
 
 static BOOL hooked_fileExistsAtPathIsDirectory(id self, SEL _cmd, NSString *path, BOOL *isDir) {
     if (is_jailbreak_path(path)) { if (isDir) *isDir = NO; return NO; }
-    return orig_fileExistsAtPathIsDirectory(self, _cmd, path, isDir);
+    if (orig_fileExistsAtPathIsDirectory_IMP) {
+        return ((BOOL(*)(id, SEL, NSString *, BOOL *))orig_fileExistsAtPathIsDirectory_IMP)(self, _cmd, path, isDir);
+    }
+    return NO;
 }
 
 #pragma mark - Hook: canOpenURL
@@ -357,6 +379,9 @@ static int fh_rebind_symbols(fh_rebinding_t rebindings[], size_t rebindings_nel)
 
 __attribute__((constructor))
 static void AntiDetectInit() {
+    // 先加载原始函数指针（用 dlsym 作为 fallback）
+    load_orig_functions();
+
     init_config();
 
     g_jailbreak_paths = @[
@@ -390,7 +415,7 @@ static void AntiDetectInit() {
         @"/var/mobile/Containers/Data/Application/",
     ];
 
-    // 使用 fishhook rebind 符号
+    // 使用 fishhook rebind 符号（覆盖 dlsym 获取的指针）
     fh_rebinding_t rebindings[] = {
         {"_dyld_image_count", hooked_dyld_image_count, (void **)&orig_dyld_image_count},
         {"_dyld_get_image_name", hooked_dyld_get_image_name, (void **)&orig_dyld_get_image_name},
@@ -405,20 +430,26 @@ static void AntiDetectInit() {
     // ObjC Method Swizzling
     Class fmClass = objc_getClass("NSFileManager");
     if (fmClass) {
-        orig_fileExistsAtPath = (void *)class_replaceMethod(fmClass, @selector(fileExistsAtPath:), (IMP)hooked_fileExistsAtPath, "B@:@");
-        orig_fileExistsAtPathIsDirectory = (void *)class_replaceMethod(fmClass, @selector(fileExistsAtPath:isDirectory:), (IMP)hooked_fileExistsAtPathIsDirectory, "B@:@^B");
+        Method m1 = class_getInstanceMethod(fmClass, @selector(fileExistsAtPath:));
+        if (m1) {
+            orig_fileExistsAtPath_IMP = method_getImplementation(m1);
+            method_setImplementation(m1, (IMP)hooked_fileExistsAtPath);
+        }
+        Method m2 = class_getInstanceMethod(fmClass, @selector(fileExistsAtPath:isDirectory:));
+        if (m2) {
+            orig_fileExistsAtPathIsDirectory_IMP = method_getImplementation(m2);
+            method_setImplementation(m2, (IMP)hooked_fileExistsAtPathIsDirectory);
+        }
     }
 
     Class appClass = objc_getClass("UIApplication");
     if (appClass) {
         Method m = class_getInstanceMethod(appClass, @selector(canOpenURL:));
-        if (m) { orig_canOpenURL = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)hooked_canOpenURL); }
+        if (m) {
+            orig_canOpenURL = (void *)method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_canOpenURL);
+        }
     }
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        NSLog(@"[AntiDetect] 初始化完成 - 隐藏关键字: %@", g_hidden_keywords);
-        uint32_t count = _dyld_image_count();
-        NSLog(@"[AntiDetect] 可见镜像数量: %u", count);
-        for (uint32_t i = 0; i < count; i++) NSLog(@"[AntiDetect]   [%u] %s", i, _dyld_get_image_name(i));
-    });
+    NSLog(@"[AntiDetect] 初始化完成 - 隐藏关键字: %@", g_hidden_keywords);
 }
