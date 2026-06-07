@@ -2,28 +2,25 @@
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
 #import <UIKit/UIKit.h>
-#import <sys/stat.h>
-#import <sys/sysctl.h>
-#import <dirent.h>
-#import <stdio.h>
 #import <string.h>
 
 /*
- * AntiDetectDylib v17 - 分阶段延迟激活版
+ * AntiDetectDylib v18 - 精准动态库隐藏版
  *
- * v16问题：
- *   - 15秒延迟太晚，易盾已扫描上报
- *   - hook安装瞬间打断IO导致卡住
+ * 关键发现：Shadow插件只需要"动态库"一项hook就能过检测！
+ * 说明网易易盾的检测核心就是扫描注入的动态库，不是文件系统/环境变量。
  *
- * v17策略：分阶段安装 + lazy activation
- *   Constructor: ObjC hook（稳定，从v6验证）
- *   +1秒: 安装getenv/sysctl hook（轻量，不涉及文件IO，始终激活）
- *   +3秒: 安装stat/access/dladdr hook（透传模式，hook就位但不拦截）
- *   +8秒: 激活IO拦截（g_c_hooks_active=1）
+ * v17卡住原因：hook了stat/access等IO函数，MSHookFunction修改IO路径导致游戏卡死
  *
- * 关键：所有MSHookFunction都必须在dispatch_after中调用！
- *   v12/v15证明constructor中调用MSHookFunction会闪退
- *   v13证明dispatch_after后调用不会闪退
+ * v18策略：只hook动态库相关函数，完全不碰IO函数！
+ *   1. _dyld_get_image_name - 隐藏越狱/注入的dylib名称
+ *   2. dladdr - 隐藏注入dylib的地址映射
+ *   3. ObjC: NSFileManager隐藏越狱路径（保险，稳定不卡）
+ *   4. ObjC: canOpenURL屏蔽越狱URL Scheme
+ *   5. 弹窗拦截
+ *
+ * 不hook的函数：stat, access, fopen, opendir, getenv, sysctl
+ * → 这些全是IO/系统函数，hook会导致卡顿或闪退，而且易盾不靠它们检测
  */
 
 #pragma mark - CydiaSubstrate
@@ -41,109 +38,55 @@ static BOOL load_MSHookFunction() {
     return (g_MSHookFunction != NULL);
 }
 
-#pragma mark - 激活标志
+#pragma mark - 需要隐藏的dylib关键词
 
-static volatile int g_c_hooks_active = 0;
+static const char *g_hide_dylib_kw[] = {
+    "CydiaSubstrate",
+    "SubstrateLoader",
+    "MobileSubstrate",
+    "TrollFools",
+    "TrollStore",
+    "AntiDetect",
+    "LIBTOOL",
+    "libhooker",
+    "substrate",
+    "Substrate",
+    NULL
+};
 
-#pragma mark - 越狱路径（纯C，按首字母分组加速查找）
-
-static const char *g_jb_A[] = { "/Applications/Cydia.app", "/Applications/Sileo.app", "/Applications/Zebra.app", "/Applications/unc0ver.app", "/Applications/Taurine.app", "/Applications/TrollStore.app", "/Applications/TrollFools.app", NULL };
-static const char *g_jb_other[] = { "/Library/MobileSubstrate", "/usr/lib/substrate", "/usr/lib/ligerness", "/usr/lib/libhooker", "/etc/apt", "/var/lib/apt", "/var/lib/cydia", "/var/jb", "/private/var/lib/cydia", "/private/var/mobile/Library/Cydia", "/private/var/jb", "/.bootstrapped_evas1on", "/.cydia_no_stash", "/.installed_unc0ver", NULL };
-
-static const char *g_hide_kw[] = { "CydiaSubstrate", "SubstrateLoader", "MobileSubstrate", "TrollFools", "TrollStore", "AntiDetect", "LIBTOOL", "libhooker", "substrate", NULL };
-
-static inline BOOL is_jb_path(const char *path) {
-    if (!path) return NO;
-    char c = path[0];
-    if (c == '/') {
-        char c2 = path[1];
-        if (c2 == 'A') {
-            for (int i = 0; g_jb_A[i]; i++)
-                if (strncmp(path, g_jb_A[i], strlen(g_jb_A[i])) == 0) return YES;
-        } else {
-            for (int i = 0; g_jb_other[i]; i++)
-                if (strncmp(path, g_jb_other[i], strlen(g_jb_other[i])) == 0) return YES;
-        }
+static inline BOOL should_hide_dylib(const char *name) {
+    if (!name) return NO;
+    for (int i = 0; g_hide_dylib_kw[i]; i++) {
+        if (strstr(name, g_hide_dylib_kw[i])) return YES;
     }
     return NO;
 }
 
-static inline BOOL should_hide_lib(const char *name) {
-    if (!name) return NO;
-    for (int i = 0; g_hide_kw[i]; i++)
-        if (strstr(name, g_hide_kw[i])) return YES;
-    return NO;
+#pragma mark - _dyld_get_image_name Hook
+
+static const char *(*orig_dyld_get_image_name)(uint32_t) = NULL;
+
+static const char *hook_dyld_get_image_name(uint32_t index) {
+    const char *name = orig_dyld_get_image_name(index);
+    if (should_hide_dylib(name)) {
+        // 返回一个空路径，假装这个image不存在
+        return "";
+    }
+    return name;
 }
 
-#pragma mark - C函数Hook
+#pragma mark - dladdr Hook
 
-static int (*orig_stat)(const char *restrict, struct stat *restrict) = NULL;
-static int (*orig_access)(const char *, int) = NULL;
 static int (*orig_dladdr)(const void *, Dl_info *) = NULL;
-static char *(*orig_getenv)(const char *) = NULL;
-static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
-
-static int hook_stat(const char *restrict path, struct stat *restrict buf) {
-    if (g_c_hooks_active && is_jb_path(path)) return -1;
-    return orig_stat(path, buf);
-}
-
-static int hook_access(const char *path, int mode) {
-    if (g_c_hooks_active && is_jb_path(path)) { errno = ENOENT; return -1; }
-    return orig_access(path, mode);
-}
 
 static int hook_dladdr(const void *addr, Dl_info *info) {
     int ret = orig_dladdr(addr, info);
-    if (g_c_hooks_active && ret && info && info->dli_fname && should_hide_lib(info->dli_fname)) {
+    if (ret && info && info->dli_fname && should_hide_dylib(info->dli_fname)) {
+        // 清空info，假装这个地址不属于任何dylib
         memset(info, 0, sizeof(Dl_info));
         return 0;
     }
     return ret;
-}
-
-static char *hook_getenv(const char *name) {
-    if (name) {
-        if (strncmp(name, "DYLD_", 5) == 0) return NULL;
-        if (strstr(name, "MSSafeMode") || strstr(name, "SUBSTRATE_HOME")) return NULL;
-    }
-    return orig_getenv(name);
-}
-
-static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    int result = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
-    if (namelen == 4 && name[0] == CTL_KERN && name[1] == KERN_PROC &&
-        name[2] == KERN_PROC_PID && oldp && oldlenp &&
-        *oldlenp >= sizeof(struct kinfo_proc)) {
-        ((struct kinfo_proc *)oldp)->kp_proc.p_flag &= ~P_TRACED;
-    }
-    return result;
-}
-
-#pragma mark - 分阶段安装
-
-static void install_env_hooks() {
-    NSLog(@"[AntiDetect] Phase2: 安装getenv/sysctl hook...");
-    if (!load_MSHookFunction()) {
-        NSLog(@"[AntiDetect] MSHookFunction不可用");
-        return;
-    }
-    g_MSHookFunction((void *)getenv, (void *)hook_getenv, (void **)&orig_getenv);
-    g_MSHookFunction((void *)sysctl, (void *)hook_sysctl, (void **)&orig_sysctl);
-    NSLog(@"[AntiDetect] Phase2: getenv/sysctl已安装（始终激活）");
-}
-
-static void install_io_hooks_inactive() {
-    NSLog(@"[AntiDetect] Phase3: 安装IO hook（透传模式）...");
-    g_MSHookFunction((void *)stat, (void *)hook_stat, (void **)&orig_stat);
-    g_MSHookFunction((void *)access, (void *)hook_access, (void **)&orig_access);
-    g_MSHookFunction((void *)dladdr, (void *)hook_dladdr, (void **)&orig_dladdr);
-    NSLog(@"[AntiDetect] Phase3: stat/access/dladdr已安装（透传），等待激活...");
-}
-
-static void activate_io_hooks() {
-    g_c_hooks_active = 1;
-    NSLog(@"[AntiDetect] Phase4: ★ IO hook已激活 ★ 开始拦截越狱路径");
 }
 
 #pragma mark - ObjC Hook
@@ -213,20 +156,20 @@ static void hooked_presentViewController(id self, SEL _cmd, UIViewController *vc
     ((void(*)(id, SEL, UIViewController *, BOOL, id))orig_presentViewController_IMP)(self, _cmd, vc, animated, completion);
 }
 
-#pragma mark - NSUserDefaults清理
+#pragma mark - 安装C函数Hook（动态库相关，延迟1秒）
 
-static void clean_anticheat_defaults() {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSDictionary *dict = [defaults dictionaryRepresentation];
-    NSMutableArray *remove = [NSMutableArray array];
-    for (NSString *key in dict) {
-        NSString *lower = key.lowercaseString;
-        if ([lower containsString:@"htp"] || [lower containsString:@"ntes"] ||
-            [lower containsString:@"anticheat"] || [lower containsString:@"risksec"])
-            [remove addObject:key];
+static void install_dylib_hooks() {
+    NSLog(@"[AntiDetect] 安装动态库Hook...");
+    if (!load_MSHookFunction()) {
+        NSLog(@"[AntiDetect] MSHookFunction不可用，尝试直接加载");
+        return;
     }
-    for (NSString *key in remove) [defaults removeObjectForKey:key];
-    if (remove.count > 0) [defaults synchronize];
+
+    // 只hook动态库相关的两个函数
+    g_MSHookFunction((void *)_dyld_get_image_name, (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
+    g_MSHookFunction((void *)dladdr, (void *)hook_dladdr, (void **)&orig_dladdr);
+
+    NSLog(@"[AntiDetect] ★ 动态库Hook安装完成 ★ _dyld_get_image_name + dladdr");
 }
 
 #pragma mark - 入口点
@@ -252,9 +195,9 @@ static void AntiDetectInit() {
             @"SubstrateLoader", @"MobileSubstrate", @"libhooker",
         ];
 
-        NSLog(@"[AntiDetect] v17 初始化...");
+        NSLog(@"[AntiDetect] v18 初始化...");
 
-        // ===== Phase 1: ObjC Hook（constructor中立即执行，稳定）=====
+        // ===== ObjC Hook（constructor中立即执行，稳定）=====
         Class fmClass = objc_getClass("NSFileManager");
         if (fmClass) {
             Method m1 = class_getInstanceMethod(fmClass, @selector(fileExistsAtPath:));
@@ -277,23 +220,12 @@ static void AntiDetectInit() {
             if (m) { orig_presentViewController_IMP = method_getImplementation(m); method_setImplementation(m, (IMP)hooked_presentViewController); }
         }
 
-        clean_anticheat_defaults();
-
-        // ===== Phase 2: +1秒 安装getenv/sysctl（轻量，始终激活）=====
+        // ===== 动态库Hook（延迟1秒，只hook _dyld_get_image_name + dladdr）=====
+        // 不hook任何IO函数（stat/access/fopen/opendir/getenv/sysctl）！
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            install_env_hooks();
+            install_dylib_hooks();
         });
 
-        // ===== Phase 3: +3秒 安装stat/access/dladdr（透传模式）=====
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            install_io_hooks_inactive();
-        });
-
-        // ===== Phase 4: +8秒 激活IO拦截 =====
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            activate_io_hooks();
-        });
-
-        NSLog(@"[AntiDetect] v17 Phase1完成 → +1s env hook → +3s IO hook(透传) → +8s 激活拦截");
+        NSLog(@"[AntiDetect] v18 ObjC完成，+1s安装动态库Hook");
     }
 }
