@@ -303,29 +303,10 @@ static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, vo
         }
     }
 
-    // KERN_SYSNAME: 伪装为iPhone而非Mac
-    if (namelen == 2 && name[0] == CTL_KERN && name[1] == KERN_SYSNAME) {
-        if (oldp && oldlenp) {
-            const char *iphone = "iPhoneOS";
-            size_t len = strlen(iphone) + 1;
-            if (*oldlenp >= len) {
-                memcpy(oldp, iphone, len);
-                *oldlenp = len;
-            }
-        }
-    }
-
-    // KERN_OSTYPE: 伪装
-    if (namelen == 2 && name[0] == CTL_KERN && name[1] == KERN_OSTYPE) {
-        if (oldp && oldlenp) {
-            const char *os = "Darwin";
-            size_t len = strlen(os) + 1;
-            if (*oldlenp >= len) {
-                memcpy(oldp, os, len);
-                *oldlenp = len;
-            }
-        }
-    }
+    // KERN_SYSNAME (值=1): 伪装为iPhone而非Mac
+    // macOS: sysctl kern.hostname 返回主机名
+    // iOS sysctl CTL_KERN name[1]==1 是 KERN_PROCARGS 在某些版本
+    // 安全起见，不做KERN_SYSNAME伪装，只做P_TRACED清除
 
     return result;
 }
