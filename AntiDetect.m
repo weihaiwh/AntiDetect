@@ -5,22 +5,20 @@
 #import <string.h>
 
 /*
- * AntiDetectDylib v18 - 精准动态库隐藏版
+ * AntiDetectDylib v19 - 仅dladdr隐藏版
  *
- * 关键发现：Shadow插件只需要"动态库"一项hook就能过检测！
- * 说明网易易盾的检测核心就是扫描注入的动态库，不是文件系统/环境变量。
+ * v18卡住原因：hook了_dyld_get_image_name返回空字符串
+ *   → 游戏遍历image列表时index错位/空名 → 死循环/卡死
+ *   → 这个函数不能hook！它影响整个image枚举逻辑
  *
- * v17卡住原因：hook了stat/access等IO函数，MSHookFunction修改IO路径导致游戏卡死
+ * v19策略：只hook dladdr，不碰_dyld_get_image_name
+ *   - dladdr只查询特定地址的dylib信息，不影响枚举
+ *   - 隐藏方式：将注入dylib的地址映射伪装为游戏主程序
+ *   - 不返回空/0（会导致崩溃），而是替换为游戏自身路径
  *
- * v18策略：只hook动态库相关函数，完全不碰IO函数！
- *   1. _dyld_get_image_name - 隐藏越狱/注入的dylib名称
- *   2. dladdr - 隐藏注入dylib的地址映射
- *   3. ObjC: NSFileManager隐藏越狱路径（保险，稳定不卡）
- *   4. ObjC: canOpenURL屏蔽越狱URL Scheme
- *   5. 弹窗拦截
- *
- * 不hook的函数：stat, access, fopen, opendir, getenv, sysctl
- * → 这些全是IO/系统函数，hook会导致卡顿或闪退，而且易盾不靠它们检测
+ * 完全不hook的函数（避免卡顿/闪退）：
+ *   _dyld_get_image_name, stat, access, fopen, opendir,
+ *   getenv, sysctl, lstat, dlopen, dlsym
  */
 
 #pragma mark - CydiaSubstrate
@@ -49,8 +47,6 @@ static const char *g_hide_dylib_kw[] = {
     "AntiDetect",
     "LIBTOOL",
     "libhooker",
-    "substrate",
-    "Substrate",
     NULL
 };
 
@@ -62,29 +58,45 @@ static inline BOOL should_hide_dylib(const char *name) {
     return NO;
 }
 
-#pragma mark - _dyld_get_image_name Hook
-
-static const char *(*orig_dyld_get_image_name)(uint32_t) = NULL;
-
-static const char *hook_dyld_get_image_name(uint32_t index) {
-    const char *name = orig_dyld_get_image_name(index);
-    if (should_hide_dylib(name)) {
-        // 返回一个空路径，假装这个image不存在
-        return "";
-    }
-    return name;
-}
-
-#pragma mark - dladdr Hook
+#pragma mark - dladdr Hook（唯一需要的C函数hook）
 
 static int (*orig_dladdr)(const void *, Dl_info *) = NULL;
+
+// 缓存游戏主程序的路径，避免每次调用都查询
+static char g_main_exec_path[1024] = {0};
+static void *g_main_exec_base = NULL;
+
+static void cache_main_exec_info() {
+    // 获取主程序路径和基地址
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strstr(name, "Application/") && !strstr(name, "Framework") && !strstr(name, "dylib")) {
+            // 这是主程序的路径（在Application目录下但不是Framework/dylib）
+            strncpy(g_main_exec_path, name, sizeof(g_main_exec_path) - 1);
+            g_main_exec_base = (void *)_dyld_get_image_header(i);
+            break;
+        }
+    }
+    if (g_main_exec_path[0] == '\0') {
+        // 回退：用第一个image
+        const char *name = _dyld_get_image_name(0);
+        if (name) strncpy(g_main_exec_path, name, sizeof(g_main_exec_path) - 1);
+        g_main_exec_base = (void *)_dyld_get_image_header(0);
+    }
+}
 
 static int hook_dladdr(const void *addr, Dl_info *info) {
     int ret = orig_dladdr(addr, info);
     if (ret && info && info->dli_fname && should_hide_dylib(info->dli_fname)) {
-        // 清空info，假装这个地址不属于任何dylib
-        memset(info, 0, sizeof(Dl_info));
-        return 0;
+        // 关键：不清空info！把注入dylib的信息伪装成游戏主程序
+        // 这样易盾查到的地址都属于"游戏本身"，不会发现注入
+        if (g_main_exec_path[0]) {
+            info->dli_fname = g_main_exec_path;
+        }
+        if (g_main_exec_base) {
+            info->dli_saddr = g_main_exec_base;
+        }
+        info->dli_sname = NULL; // 清除符号名
     }
     return ret;
 }
@@ -156,20 +168,20 @@ static void hooked_presentViewController(id self, SEL _cmd, UIViewController *vc
     ((void(*)(id, SEL, UIViewController *, BOOL, id))orig_presentViewController_IMP)(self, _cmd, vc, animated, completion);
 }
 
-#pragma mark - 安装C函数Hook（动态库相关，延迟1秒）
+#pragma mark - NSUserDefaults清理
 
-static void install_dylib_hooks() {
-    NSLog(@"[AntiDetect] 安装动态库Hook...");
-    if (!load_MSHookFunction()) {
-        NSLog(@"[AntiDetect] MSHookFunction不可用，尝试直接加载");
-        return;
+static void clean_anticheat_defaults() {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSDictionary *dict = [defaults dictionaryRepresentation];
+    NSMutableArray *remove = [NSMutableArray array];
+    for (NSString *key in dict) {
+        NSString *lower = key.lowercaseString;
+        if ([lower containsString:@"htp"] || [lower containsString:@"ntes"] ||
+            [lower containsString:@"anticheat"] || [lower containsString:@"risksec"])
+            [remove addObject:key];
     }
-
-    // 只hook动态库相关的两个函数
-    g_MSHookFunction((void *)_dyld_get_image_name, (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
-    g_MSHookFunction((void *)dladdr, (void *)hook_dladdr, (void **)&orig_dladdr);
-
-    NSLog(@"[AntiDetect] ★ 动态库Hook安装完成 ★ _dyld_get_image_name + dladdr");
+    for (NSString *key in remove) [defaults removeObjectForKey:key];
+    if (remove.count > 0) [defaults synchronize];
 }
 
 #pragma mark - 入口点
@@ -195,7 +207,11 @@ static void AntiDetectInit() {
             @"SubstrateLoader", @"MobileSubstrate", @"libhooker",
         ];
 
-        NSLog(@"[AntiDetect] v18 初始化...");
+        NSLog(@"[AntiDetect] v19 初始化...");
+
+        // 缓存游戏主程序信息（constructor中可用，不需要hook）
+        cache_main_exec_info();
+        NSLog(@"[AntiDetect] 主程序路径: %s", g_main_exec_path);
 
         // ===== ObjC Hook（constructor中立即执行，稳定）=====
         Class fmClass = objc_getClass("NSFileManager");
@@ -220,12 +236,19 @@ static void AntiDetectInit() {
             if (m) { orig_presentViewController_IMP = method_getImplementation(m); method_setImplementation(m, (IMP)hooked_presentViewController); }
         }
 
-        // ===== 动态库Hook（延迟1秒，只hook _dyld_get_image_name + dladdr）=====
-        // 不hook任何IO函数（stat/access/fopen/opendir/getenv/sysctl）！
+        clean_anticheat_defaults();
+
+        // ===== dladdr Hook（延迟1秒，唯一需要的C函数hook）=====
+        // 不hook: _dyld_get_image_name(会卡死), stat/access/fopen(会卡顿)
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            install_dylib_hooks();
+            if (load_MSHookFunction()) {
+                g_MSHookFunction((void *)dladdr, (void *)hook_dladdr, (void **)&orig_dladdr);
+                NSLog(@"[AntiDetect] ★ dladdr hook安装完成 ★");
+            } else {
+                NSLog(@"[AntiDetect] MSHookFunction不可用");
+            }
         });
 
-        NSLog(@"[AntiDetect] v18 ObjC完成，+1s安装动态库Hook");
+        NSLog(@"[AntiDetect] v19 ObjC完成，+1s安装dladdr hook");
     }
 }
