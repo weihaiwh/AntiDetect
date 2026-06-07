@@ -2,58 +2,111 @@
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
 #import <UIKit/UIKit.h>
+#import <sys/stat.h>
 #import <string.h>
+#import <stdio.h>
+#import <stdlib.h>
+#import "fishhook.h"
 
 /*
- * AntiDetectDylib v21 - 纯ObjC动态库隐藏版（不用MSHookFunction）
+ * AntiDetectDylib v22 - fishhook原版 + ObjC Hook
  *
- * 根本发现：MSHookFunction在TrollStore/TrollFools注入环境下会卡死
- *   - v12-v20所有使用MSHookFunction的版本都会卡住或闪退
- *   - v6纯ObjC版本是唯一稳定运行的
+ * 核心发现：
+ *   - MSHookFunction在非越狱下不可用 → 需要修改__TEXT段（W^X禁止）
+ *   - fishhook只修改__DATA段 → 不受W^X限制 → 非越狱可用
+ *   - 之前v7 fishhook闪退可能是因为hook了不安全的函数或编译问题
  *
- * Shadow的"动态库"hook主要做什么（从源码分析）：
- *   1. _dyld_image_count/name/header/slide → MSHookFunction → 不可用
- *   2. task_info(TASK_DYLD_INFO) → MSHookFunction → 不可用
- *   3. dladdr → MSHookFunction → 不可用
- *   4. objc_copyImageNames → MSHookFunction → 不可用
- *   5. class_getImageName → MSHookFunction → 不可用
- *   6. NSBundle → ObjC swizzle → ✅ 可用！
- *   7. NSFileManager → ObjC swizzle → ✅ 可用！
- *   8. UIApplication canOpenURL → ObjC swizzle → ✅ 可用！
+ * v22使用Facebook原版fishhook库：
+ *   - 只hook动态链接的C函数（stat, access, fopen, opendir, dladdr）
+ *   - 不hook dyld函数（_dyld_image_count等不能用fishhook！）
+ *   - 不hook静态链接的函数
+ *   - dispatch_after 1秒安装
  *
- * 网易易盾是Unity IL2CPP游戏，检测动态库的路径：
- *   - C# P/Invoke → ObjC API (NSBundle, NSFileManager)
- *   - C# P/Invoke → C API (dyld_*, dladdr) ← 无法用ObjC拦截
- *
- * 但是！Shadow测试只开"动态库"就能过检测，而Shadow越狱版用的是MSHookFunction
- * 在非越狱环境下，易盾可能走不同的检测路径：
- *   - 通过NSBundle检查已加载的framework
- *   - 通过NSFileManager检查文件存在
- *   - 通过objc_getClassList/objc_copyClassList检查注入的ObjC类
- *   - 通过NSURLSession上报收集到的数据
- *
- * v21策略：纯ObjC，全面覆盖Shadow的"动态库"维度
- *   1. NSBundle hook - 隐藏越狱/tweak bundle
- *   2. NSFileManager hook - 隐藏越狱文件路径
- *   3. UIApplication hook - 隐藏越狱URL Scheme
- *   4. UIViewController hook - 拦截检测弹窗
- *   5. NSClassFromString hook - 隐藏tweak类
- *   6. objc_copyClassList hook - 从类列表中隐藏tweak类
- *   7. allBundles/allFrameworks hook - 隐藏注入的bundle
+ * ObjC Hook（constructor中立即执行）：
+ *   - NSFileManager: fileExistsAtPath等
+ *   - NSBundle: bundleWithPath, allBundles, allFrameworks
+ *   - UIApplication: canOpenURL
+ *   - UIViewController: presentViewController（拦截弹窗）
  */
 
-#pragma mark - 路径/关键词判断
+#pragma mark - 越狱路径判断（纯C）
+
+static const char *g_jb_A[] = { "/Applications/Cydia.app", "/Applications/Sileo.app", "/Applications/Zebra.app", "/Applications/unc0ver.app", "/Applications/Taurine.app", "/Applications/TrollStore.app", "/Applications/TrollFools.app", NULL };
+static const char *g_jb_other[] = { "/Library/MobileSubstrate", "/usr/lib/substrate", "/usr/lib/ligerness", "/usr/lib/libhooker", "/etc/apt", "/var/lib/apt", "/var/lib/cydia", "/var/jb", "/private/var/lib/cydia", "/private/var/mobile/Library/Cydia", "/private/var/jb", "/.bootstrapped_evas1on", "/.cydia_no_stash", "/.installed_unc0ver", NULL };
+
+static const char *g_hide_dylib_kw[] = { "CydiaSubstrate", "SubstrateLoader", "MobileSubstrate", "TrollFools", "TrollStore", "AntiDetect", "LIBTOOL", "libhooker", "substrate", NULL };
+
+static inline BOOL is_jb_path(const char *path) {
+    if (!path) return NO;
+    char c = path[0];
+    if (c == '/') {
+        char c2 = path[1];
+        if (c2 == 'A') {
+            for (int i = 0; g_jb_A[i]; i++)
+                if (strncmp(path, g_jb_A[i], strlen(g_jb_A[i])) == 0) return YES;
+        } else {
+            for (int i = 0; g_jb_other[i]; i++)
+                if (strncmp(path, g_jb_other[i], strlen(g_jb_other[i])) == 0) return YES;
+        }
+    }
+    return NO;
+}
+
+static inline BOOL should_hide_dylib(const char *name) {
+    if (!name) return NO;
+    for (int i = 0; g_hide_dylib_kw[i]; i++)
+        if (strstr(name, g_hide_dylib_kw[i])) return YES;
+    return NO;
+}
+
+#pragma mark - C函数Hook（fishhook）
+
+static int (*orig_stat)(const char *restrict, struct stat *restrict) = NULL;
+static int (*orig_access)(const char *, int) = NULL;
+static FILE *(*orig_fopen)(const char *restrict, const char *restrict) = NULL;
+static DIR *(*orig_opendir)(const char *) = NULL;
+static int (*orig_dladdr)(const void *, Dl_info *) = NULL;
+
+static char g_main_exec_path[1024] = {0};
+
+static int hook_stat(const char *restrict path, struct stat *restrict buf) {
+    if (is_jb_path(path)) return -1;
+    return orig_stat(path, buf);
+}
+
+static int hook_access(const char *path, int mode) {
+    if (is_jb_path(path)) { errno = ENOENT; return -1; }
+    return orig_access(path, mode);
+}
+
+static FILE *hook_fopen(const char *restrict path, const char *restrict mode) {
+    if (is_jb_path(path)) { errno = ENOENT; return NULL; }
+    return orig_fopen(path, mode);
+}
+
+static DIR *hook_opendir(const char *path) {
+    if (is_jb_path(path)) { errno = ENOENT; return NULL; }
+    return orig_opendir(path);
+}
+
+static int hook_dladdr(const void *addr, Dl_info *info) {
+    int ret = orig_dladdr(addr, info);
+    if (ret && info && info->dli_fname && should_hide_dylib(info->dli_fname)) {
+        if (g_main_exec_path[0]) {
+            info->dli_fname = g_main_exec_path;
+        }
+        info->dli_sname = NULL;
+    }
+    return ret;
+}
+
+#pragma mark - ObjC Hook
 
 static NSArray *g_jb_paths_ns = nil;
 static NSArray *g_hide_kw_ns = nil;
-static NSString *g_app_bundle_path = nil;
 
-static BOOL is_restricted_path(NSString *path) {
+static BOOL should_block_ns(NSString *path) {
     if (!path || path.length == 0) return NO;
-
-    // 游戏自身路径不拦截
-    if (g_app_bundle_path && [path hasPrefix:g_app_bundle_path]) return NO;
-
     for (NSString *jp in g_jb_paths_ns) {
         if ([path hasPrefix:jp]) return YES;
     }
@@ -64,39 +117,23 @@ static BOOL is_restricted_path(NSString *path) {
     return NO;
 }
 
-static BOOL is_restricted_class(const char *name) {
-    if (!name) return NO;
-    // 隐藏CydiaSubstrate相关类
-    static const char *hide_class_kw[] = {
-        "CydiaSubstrate", "SubstrateLoader", "MobileSubstrate",
-        "TrollFools", "TrollStore", "AntiDetect",
-        "LIBTOOL", "libhooker", "SubstrateHook",
-        "MSHook", "HBLog", "libSandy",
-        NULL
-    };
-    for (int i = 0; hide_class_kw[i]; i++) {
-        if (strstr(name, hide_class_kw[i])) return YES;
-    }
-    return NO;
-}
-
-#pragma mark - NSFileManager Hook
-
 static IMP orig_fileExistsAtPath_IMP = NULL;
 static IMP orig_fileExistsAtPathIsDir_IMP = NULL;
 static IMP orig_contentsOfDirectoryAtPath_IMP = NULL;
-static IMP orig_subpathsOfDirectoryAtPath_IMP = NULL;
-static IMP orig_isReadableFileAtPath_IMP = NULL;
-static IMP orig_isExecutableFileAtPath_IMP = NULL;
-static IMP orig_attributesOfItemAtPath_IMP = NULL;
+static IMP orig_canOpenURL_IMP = NULL;
+static IMP orig_presentViewController_IMP = NULL;
+static IMP orig_bundleWithPath_IMP = NULL;
+static IMP orig_bundleForClass_IMP = NULL;
+static IMP orig_allBundles_IMP = NULL;
+static IMP orig_allFrameworks_IMP = NULL;
 
 static BOOL hooked_fileExistsAtPath(id self, SEL _cmd, NSString *path) {
-    if (is_restricted_path(path)) return NO;
+    if (should_block_ns(path)) return NO;
     return ((BOOL(*)(id, SEL, NSString *))orig_fileExistsAtPath_IMP)(self, _cmd, path);
 }
 
 static BOOL hooked_fileExistsAtPathIsDir(id self, SEL _cmd, NSString *path, BOOL *isDir) {
-    if (is_restricted_path(path)) { if (isDir) *isDir = NO; return NO; }
+    if (should_block_ns(path)) { if (isDir) *isDir = NO; return NO; }
     return ((BOOL(*)(id, SEL, NSString *, BOOL *))orig_fileExistsAtPathIsDir_IMP)(self, _cmd, path, isDir);
 }
 
@@ -106,90 +143,10 @@ static NSArray *hooked_contentsOfDirectoryAtPath(id self, SEL _cmd, NSString *pa
     NSMutableArray *filtered = [NSMutableArray arrayWithCapacity:result.count];
     for (NSString *item in result) {
         NSString *fullPath = [path stringByAppendingPathComponent:item];
-        if (!is_restricted_path(fullPath)) [filtered addObject:item];
+        if (!should_block_ns(fullPath)) [filtered addObject:item];
     }
     return [filtered copy];
 }
-
-static NSArray *hooked_subpathsOfDirectoryAtPath(id self, SEL _cmd, NSString *path, NSError **error) {
-    if (is_restricted_path(path)) return @[];
-    NSArray *result = ((NSArray *(*)(id, SEL, NSString *, NSError **))orig_subpathsOfDirectoryAtPath_IMP)(self, _cmd, path, error);
-    if (!result) return result;
-    NSMutableArray *filtered = [NSMutableArray arrayWithCapacity:result.count];
-    for (NSString *item in result) {
-        if (!is_restricted_path(item)) [filtered addObject:item];
-    }
-    return [filtered copy];
-}
-
-static BOOL hooked_isReadableFileAtPath(id self, SEL _cmd, NSString *path) {
-    if (is_restricted_path(path)) return NO;
-    return ((BOOL(*)(id, SEL, NSString *))orig_isReadableFileAtPath_IMP)(self, _cmd, path);
-}
-
-static BOOL hooked_isExecutableFileAtPath(id self, SEL _cmd, NSString *path) {
-    if (is_restricted_path(path)) return NO;
-    return ((BOOL(*)(id, SEL, NSString *))orig_isExecutableFileAtPath_IMP)(self, _cmd, path);
-}
-
-static NSDictionary *hooked_attributesOfItemAtPath(id self, SEL _cmd, NSString *path, NSError **error) {
-    if (is_restricted_path(path)) { if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileNoSuchFileError userInfo:nil]; return nil; }
-    return ((NSDictionary *(*)(id, SEL, NSString *, NSError **))orig_attributesOfItemAtPath_IMP)(self, _cmd, path, error);
-}
-
-#pragma mark - NSBundle Hook
-
-static IMP orig_bundleWithPath_IMP = NULL;
-static IMP orig_bundleWithURL_IMP = NULL;
-static IMP orig_bundleForClass_IMP = NULL;
-static IMP orig_allBundles_IMP = NULL;
-static IMP orig_allFrameworks_IMP = NULL;
-static IMP orig_bundleIdentifier_IMP = NULL;
-static IMP orig_bundlePath_IMP = NULL;
-static IMP orig_initWithPath_IMP = NULL;
-
-static id hooked_bundleWithPath(id self, SEL _cmd, NSString *path) {
-    if (is_restricted_path(path)) return nil;
-    return ((id(*)(id, SEL, NSString *))orig_bundleWithPath_IMP)(self, _cmd, path);
-}
-
-static id hooked_bundleWithURL(id self, SEL _cmd, NSURL *url) {
-    if (url && is_restricted_path([url path])) return nil;
-    return ((id(*)(id, SEL, NSURL *))orig_bundleWithURL_IMP)(self, _cmd, url);
-}
-
-static id hooked_bundleForClass(id self, SEL _cmd, Class cls) {
-    id result = ((id(*)(id, SEL, Class))orig_bundleForClass_IMP)(self, _cmd, cls);
-    if (result) {
-        NSString *bPath = [(NSBundle *)result bundlePath];
-        if (is_restricted_path(bPath)) return nil;
-    }
-    return result;
-}
-
-static NSArray *hooked_allBundles(id self, SEL _cmd) {
-    NSArray *result = ((NSArray *(*)(id, SEL))orig_allBundles_IMP)(self, _cmd);
-    if (!result) return result;
-    NSMutableArray *filtered = [NSMutableArray arrayWithCapacity:result.count];
-    for (NSBundle *bundle in result) {
-        if (!is_restricted_path([bundle bundlePath])) [filtered addObject:bundle];
-    }
-    return [filtered copy];
-}
-
-static NSArray *hooked_allFrameworks(id self, SEL _cmd) {
-    NSArray *result = ((NSArray *(*)(id, SEL))orig_allFrameworks_IMP)(self, _cmd);
-    if (!result) return result;
-    NSMutableArray *filtered = [NSMutableArray arrayWithCapacity:result.count];
-    for (NSBundle *bundle in result) {
-        if (!is_restricted_path([bundle bundlePath])) [filtered addObject:bundle];
-    }
-    return [filtered copy];
-}
-
-#pragma mark - UIApplication Hook
-
-static IMP orig_canOpenURL_IMP = NULL;
 
 static BOOL hooked_canOpenURL(id self, SEL _cmd, NSURL *url) {
     if (url) {
@@ -202,10 +159,6 @@ static BOOL hooked_canOpenURL(id self, SEL _cmd, NSURL *url) {
     return ((BOOL(*)(id, SEL, NSURL *))orig_canOpenURL_IMP)(self, _cmd, url);
 }
 
-#pragma mark - UIViewController Hook (拦截弹窗)
-
-static IMP orig_presentViewController_IMP = NULL;
-
 static void hooked_presentViewController(id self, SEL _cmd, UIViewController *vc, BOOL animated, id completion) {
     if ([vc isKindOfClass:[UIAlertController class]]) {
         UIAlertController *alert = (UIAlertController *)vc;
@@ -216,6 +169,80 @@ static void hooked_presentViewController(id self, SEL _cmd, UIViewController *vc
         }
     }
     ((void(*)(id, SEL, UIViewController *, BOOL, id))orig_presentViewController_IMP)(self, _cmd, vc, animated, completion);
+}
+
+static id hooked_bundleWithPath(id self, SEL _cmd, NSString *path) {
+    if (should_block_ns(path)) return nil;
+    return ((id(*)(id, SEL, NSString *))orig_bundleWithPath_IMP)(self, _cmd, path);
+}
+
+static id hooked_bundleForClass(id self, SEL _cmd, Class cls) {
+    id result = ((id(*)(id, SEL, Class))orig_bundleForClass_IMP)(self, _cmd, cls);
+    if (result) {
+        NSString *bPath = [(NSBundle *)result bundlePath];
+        if (should_block_ns(bPath)) return nil;
+    }
+    return result;
+}
+
+static NSArray *hooked_allBundles(id self, SEL _cmd) {
+    NSArray *result = ((NSArray *(*)(id, SEL))orig_allBundles_IMP)(self, _cmd);
+    if (!result) return result;
+    NSMutableArray *filtered = [NSMutableArray arrayWithCapacity:result.count];
+    for (NSBundle *bundle in result) {
+        if (!should_block_ns([bundle bundlePath])) [filtered addObject:bundle];
+    }
+    return [filtered copy];
+}
+
+static NSArray *hooked_allFrameworks(id self, SEL _cmd) {
+    NSArray *result = ((NSArray *(*)(id, SEL))orig_allFrameworks_IMP)(self, _cmd);
+    if (!result) return result;
+    NSMutableArray *filtered = [NSMutableArray arrayWithCapacity:result.count];
+    for (NSBundle *bundle in result) {
+        if (!should_block_ns([bundle bundlePath])) [filtered addObject:bundle];
+    }
+    return [filtered copy];
+}
+
+#pragma mark - 安装fishhook
+
+static void install_fishhooks() {
+    NSLog(@"[AntiDetect] 安装fishhook...");
+
+    // 缓存游戏主程序路径
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strstr(name, "/Application/") && !strstr(name, "/Applications/") &&
+            !strstr(name, ".dylib") && !strstr(name, ".framework/")) {
+            strncpy(g_main_exec_path, name, sizeof(g_main_exec_path) - 1);
+            break;
+        }
+    }
+    if (g_main_exec_path[0] == '\0') {
+        const char *name = _dyld_get_image_name(0);
+        if (name) strncpy(g_main_exec_path, name, sizeof(g_main_exec_path) - 1);
+    }
+    NSLog(@"[AntiDetect] 主程序: %s", g_main_exec_path);
+
+    // 使用Facebook fishhook重绑定符号
+    struct rebinding rebindings[] = {
+        {"stat",       (void *)hook_stat,       (void **)&orig_stat},
+        {"access",     (void *)hook_access,     (void **)&orig_access},
+        {"fopen",      (void *)hook_fopen,      (void **)&orig_fopen},
+        {"opendir",    (void *)hook_opendir,    (void **)&orig_opendir},
+        {"dladdr",     (void *)hook_dladdr,     (void **)&orig_dladdr},
+    };
+
+    int ret = rebind_symbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
+    NSLog(@"[AntiDetect] fishhook rebind_symbols 返回: %d", ret);
+
+    if (orig_stat && orig_access && orig_fopen && orig_opendir && orig_dladdr) {
+        NSLog(@"[AntiDetect] ★ fishhook安装完成 ★ 所有原始函数指针已获取");
+    } else {
+        NSLog(@"[AntiDetect] ⚠ fishhook部分失败: stat=%p access=%p fopen=%p opendir=%p dladdr=%p",
+              orig_stat, orig_access, orig_fopen, orig_opendir, orig_dladdr);
+    }
 }
 
 #pragma mark - NSUserDefaults清理
@@ -236,15 +263,6 @@ static void clean_anticheat_defaults() {
 
 #pragma mark - 入口点
 
-static void swizzle(Class cls, SEL sel, IMP newIMP, IMP *origIMP) {
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) m = class_getClassMethod(cls, sel);
-    if (m) {
-        *origIMP = method_getImplementation(m);
-        method_setImplementation(m, newIMP);
-    }
-}
-
 __attribute__((constructor))
 static void AntiDetectInit() {
     @autoreleasepool {
@@ -264,59 +282,53 @@ static void AntiDetectInit() {
             @"AntiDetect", @"LIBTOOL", @"CydiaSubstrate",
             @"TrollFools", @"TrollStore", @"substrate",
             @"SubstrateLoader", @"MobileSubstrate", @"libhooker",
-            @"Shadow", @"libSandy", @"RootBridge",
-            @"HookKit", @"PreferenceLoader",
         ];
 
-        // 获取app bundle路径
-        g_app_bundle_path = [[NSBundle mainBundle] bundlePath];
-        NSLog(@"[AntiDetect] v21 初始化（纯ObjC，基于Shadow源码）...");
-        NSLog(@"[AntiDetect] App Bundle: %@", g_app_bundle_path);
+        NSLog(@"[AntiDetect] v22 初始化（fishhook原版）...");
 
-        // ===== NSFileManager Hook =====
+        // ===== ObjC Hook（constructor中立即执行）=====
         Class fmClass = objc_getClass("NSFileManager");
         if (fmClass) {
-            swizzle(fmClass, @selector(fileExistsAtPath:), (IMP)hooked_fileExistsAtPath, &orig_fileExistsAtPath_IMP);
-            swizzle(fmClass, @selector(fileExistsAtPath:isDirectory:), (IMP)hooked_fileExistsAtPathIsDir, &orig_fileExistsAtPathIsDir_IMP);
-            swizzle(fmClass, @selector(contentsOfDirectoryAtPath:error:), (IMP)hooked_contentsOfDirectoryAtPath, &orig_contentsOfDirectoryAtPath_IMP);
-            swizzle(fmClass, @selector(subpathsOfDirectoryAtPath:error:), (IMP)hooked_subpathsOfDirectoryAtPath, &orig_subpathsOfDirectoryAtPath_IMP);
-            swizzle(fmClass, @selector(isReadableFileAtPath:), (IMP)hooked_isReadableFileAtPath, &orig_isReadableFileAtPath_IMP);
-            swizzle(fmClass, @selector(isExecutableFileAtPath:), (IMP)hooked_isExecutableFileAtPath, &orig_isExecutableFileAtPath_IMP);
-            swizzle(fmClass, @selector(attributesOfItemAtPath:error:), (IMP)hooked_attributesOfItemAtPath, &orig_attributesOfItemAtPath_IMP);
+            Method m1 = class_getInstanceMethod(fmClass, @selector(fileExistsAtPath:));
+            if (m1) { orig_fileExistsAtPath_IMP = method_getImplementation(m1); method_setImplementation(m1, (IMP)hooked_fileExistsAtPath); }
+            Method m2 = class_getInstanceMethod(fmClass, @selector(fileExistsAtPath:isDirectory:));
+            if (m2) { orig_fileExistsAtPathIsDir_IMP = method_getImplementation(m2); method_setImplementation(m2, (IMP)hooked_fileExistsAtPathIsDir); }
+            Method m3 = class_getInstanceMethod(fmClass, @selector(contentsOfDirectoryAtPath:error:));
+            if (m3) { orig_contentsOfDirectoryAtPath_IMP = method_getImplementation(m3); method_setImplementation(m3, (IMP)hooked_contentsOfDirectoryAtPath); }
         }
 
-        // ===== NSBundle Hook（Shadow动态库维度的ObjC层）=====
         Class bundleClass = objc_getClass("NSBundle");
         if (bundleClass) {
-            // 类方法 hook - 需要用meta class
-            Class bundleMetaClass = object_getClass(bundleClass);
-            Method m1 = class_getInstanceMethod(bundleMetaClass, @selector(bundleWithPath:));
-            if (m1) { orig_bundleWithPath_IMP = method_getImplementation(m1); method_setImplementation(m1, (IMP)hooked_bundleWithPath); }
-            Method m2 = class_getInstanceMethod(bundleMetaClass, @selector(bundleWithURL:));
-            if (m2) { orig_bundleWithURL_IMP = method_getImplementation(m2); method_setImplementation(m2, (IMP)hooked_bundleWithURL); }
-            Method m3 = class_getInstanceMethod(bundleMetaClass, @selector(bundleForClass:));
-            if (m3) { orig_bundleForClass_IMP = method_getImplementation(m3); method_setImplementation(m3, (IMP)hooked_bundleForClass); }
-            Method m4 = class_getInstanceMethod(bundleMetaClass, @selector(allBundles));
-            if (m4) { orig_allBundles_IMP = method_getImplementation(m4); method_setImplementation(m4, (IMP)hooked_allBundles); }
-            Method m5 = class_getInstanceMethod(bundleMetaClass, @selector(allFrameworks));
-            if (m5) { orig_allFrameworks_IMP = method_getImplementation(m5); method_setImplementation(m5, (IMP)hooked_allFrameworks); }
+            Class metaClass = object_getClass(bundleClass);
+            Method mb1 = class_getInstanceMethod(metaClass, @selector(bundleWithPath:));
+            if (mb1) { orig_bundleWithPath_IMP = method_getImplementation(mb1); method_setImplementation(mb1, (IMP)hooked_bundleWithPath); }
+            Method mb2 = class_getInstanceMethod(metaClass, @selector(bundleForClass:));
+            if (mb2) { orig_bundleForClass_IMP = method_getImplementation(mb2); method_setImplementation(mb2, (IMP)hooked_bundleForClass); }
+            Method mb3 = class_getInstanceMethod(metaClass, @selector(allBundles));
+            if (mb3) { orig_allBundles_IMP = method_getImplementation(mb3); method_setImplementation(mb3, (IMP)hooked_allBundles); }
+            Method mb4 = class_getInstanceMethod(metaClass, @selector(allFrameworks));
+            if (mb4) { orig_allFrameworks_IMP = method_getImplementation(mb4); method_setImplementation(mb4, (IMP)hooked_allFrameworks); }
         }
 
-        // ===== UIApplication Hook =====
         Class appClass = objc_getClass("UIApplication");
         if (appClass) {
-            swizzle(appClass, @selector(canOpenURL:), (IMP)hooked_canOpenURL, &orig_canOpenURL_IMP);
+            Method m = class_getInstanceMethod(appClass, @selector(canOpenURL:));
+            if (m) { orig_canOpenURL_IMP = method_getImplementation(m); method_setImplementation(m, (IMP)hooked_canOpenURL); }
         }
 
-        // ===== UIViewController Hook =====
         Class vcClass = objc_getClass("UIViewController");
         if (vcClass) {
-            swizzle(vcClass, @selector(presentViewController:animated:completion:), (IMP)hooked_presentViewController, &orig_presentViewController_IMP);
+            Method m = class_getInstanceMethod(vcClass, @selector(presentViewController:animated:completion:));
+            if (m) { orig_presentViewController_IMP = method_getImplementation(m); method_setImplementation(m, (IMP)hooked_presentViewController); }
         }
 
-        // ===== 清理反作弊缓存 =====
         clean_anticheat_defaults();
 
-        NSLog(@"[AntiDetect] v21 完成 - NSFileManager + NSBundle + UIApplication + UIViewController");
+        // ===== fishhook（延迟1秒）=====
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            install_fishhooks();
+        });
+
+        NSLog(@"[AntiDetect] v22 ObjC完成，+1s fishhook");
     }
 }
