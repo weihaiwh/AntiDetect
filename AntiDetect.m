@@ -9,25 +9,21 @@
 #import <string.h>
 
 /*
- * AntiDetectDylib v16 - 最终稳定版
+ * AntiDetectDylib v17 - 分阶段延迟激活版
  *
- * 经过v1-v15的测试，得出的结论：
- *   1. constructor中调用MSHookFunction → 闪退
- *   2. dispatch_after 1-3秒后调用MSHookFunction → 卡住（hook后IO性能差）
- *   3. 纯ObjC hook（NSFileManager/canOpenURL） → 稳定，但拦不住C层检测
- *   4. fishhook/DYLD_INTERPOSE → 闪退
+ * v16问题：
+ *   - 15秒延迟太晚，易盾已扫描上报
+ *   - hook安装瞬间打断IO导致卡住
  *
- * v16策略：
- *   A) ObjC hook在constructor中立即执行（稳定基础）
- *   B) C函数hook延迟15秒后安装（游戏已完全加载，不影响性能）
- *   C) C函数hook只保留最关键的：stat + access + dladdr + getenv + sysctl
- *   D) 不hook fopen/opendir（减少拦截面，NSFileManager已覆盖）
- *   E) hook函数用最精简的纯C代码，首字符快速过滤
+ * v17策略：分阶段安装 + lazy activation
+ *   Constructor: ObjC hook（稳定，从v6验证）
+ *   +1秒: 安装getenv/sysctl hook（轻量，不涉及文件IO，始终激活）
+ *   +3秒: 安装stat/access/dladdr hook（透传模式，hook就位但不拦截）
+ *   +8秒: 激活IO拦截（g_c_hooks_active=1）
  *
- * 15秒延迟的理由：
- *   - 易盾检测在选角色后才触发（至少30秒后）
- *   - 15秒时游戏资源加载早已完成，不再密集IO
- *   - hook安装后只增加约20条strncmp比较/次调用，不影响性能
+ * 关键：所有MSHookFunction都必须在dispatch_after中调用！
+ *   v12/v15证明constructor中调用MSHookFunction会闪退
+ *   v13证明dispatch_after后调用不会闪退
  */
 
 #pragma mark - CydiaSubstrate
@@ -45,11 +41,13 @@ static BOOL load_MSHookFunction() {
     return (g_MSHookFunction != NULL);
 }
 
+#pragma mark - 激活标志
+
+static volatile int g_c_hooks_active = 0;
+
 #pragma mark - 越狱路径（纯C，按首字母分组加速查找）
 
-// 以 /A 开头
 static const char *g_jb_A[] = { "/Applications/Cydia.app", "/Applications/Sileo.app", "/Applications/Zebra.app", "/Applications/unc0ver.app", "/Applications/Taurine.app", "/Applications/TrollStore.app", "/Applications/TrollFools.app", NULL };
-// 以 /L /U /E /V /P /. 开头
 static const char *g_jb_other[] = { "/Library/MobileSubstrate", "/usr/lib/substrate", "/usr/lib/ligerness", "/usr/lib/libhooker", "/etc/apt", "/var/lib/apt", "/var/lib/cydia", "/var/jb", "/private/var/lib/cydia", "/private/var/mobile/Library/Cydia", "/private/var/jb", "/.bootstrapped_evas1on", "/.cydia_no_stash", "/.installed_unc0ver", NULL };
 
 static const char *g_hide_kw[] = { "CydiaSubstrate", "SubstrateLoader", "MobileSubstrate", "TrollFools", "TrollStore", "AntiDetect", "LIBTOOL", "libhooker", "substrate", NULL };
@@ -86,18 +84,18 @@ static char *(*orig_getenv)(const char *) = NULL;
 static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
 
 static int hook_stat(const char *restrict path, struct stat *restrict buf) {
-    if (is_jb_path(path)) return -1;
+    if (g_c_hooks_active && is_jb_path(path)) return -1;
     return orig_stat(path, buf);
 }
 
 static int hook_access(const char *path, int mode) {
-    if (is_jb_path(path)) { errno = ENOENT; return -1; }
+    if (g_c_hooks_active && is_jb_path(path)) { errno = ENOENT; return -1; }
     return orig_access(path, mode);
 }
 
 static int hook_dladdr(const void *addr, Dl_info *info) {
     int ret = orig_dladdr(addr, info);
-    if (ret && info && info->dli_fname && should_hide_lib(info->dli_fname)) {
+    if (g_c_hooks_active && ret && info && info->dli_fname && should_hide_lib(info->dli_fname)) {
         memset(info, 0, sizeof(Dl_info));
         return 0;
     }
@@ -122,22 +120,30 @@ static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, vo
     return result;
 }
 
-#pragma mark - 延迟安装C函数Hook（关键：不在constructor中调用MSHookFunction！）
+#pragma mark - 分阶段安装
 
-static void install_c_hooks() {
-    NSLog(@"[AntiDetect] 开始安装C函数Hook...");
+static void install_env_hooks() {
+    NSLog(@"[AntiDetect] Phase2: 安装getenv/sysctl hook...");
     if (!load_MSHookFunction()) {
         NSLog(@"[AntiDetect] MSHookFunction不可用");
         return;
     }
+    g_MSHookFunction((void *)getenv, (void *)hook_getenv, (void **)&orig_getenv);
+    g_MSHookFunction((void *)sysctl, (void *)hook_sysctl, (void **)&orig_sysctl);
+    NSLog(@"[AntiDetect] Phase2: getenv/sysctl已安装（始终激活）");
+}
 
+static void install_io_hooks_inactive() {
+    NSLog(@"[AntiDetect] Phase3: 安装IO hook（透传模式）...");
     g_MSHookFunction((void *)stat, (void *)hook_stat, (void **)&orig_stat);
     g_MSHookFunction((void *)access, (void *)hook_access, (void **)&orig_access);
     g_MSHookFunction((void *)dladdr, (void *)hook_dladdr, (void **)&orig_dladdr);
-    g_MSHookFunction((void *)getenv, (void *)hook_getenv, (void **)&orig_getenv);
-    g_MSHookFunction((void *)sysctl, (void *)hook_sysctl, (void **)&orig_sysctl);
+    NSLog(@"[AntiDetect] Phase3: stat/access/dladdr已安装（透传），等待激活...");
+}
 
-    NSLog(@"[AntiDetect] ★ C函数Hook安装完成 ★ stat/access/dladdr/getenv/sysctl");
+static void activate_io_hooks() {
+    g_c_hooks_active = 1;
+    NSLog(@"[AntiDetect] Phase4: ★ IO hook已激活 ★ 开始拦截越狱路径");
 }
 
 #pragma mark - ObjC Hook
@@ -246,9 +252,9 @@ static void AntiDetectInit() {
             @"SubstrateLoader", @"MobileSubstrate", @"libhooker",
         ];
 
-        NSLog(@"[AntiDetect] v16 初始化...");
+        NSLog(@"[AntiDetect] v17 初始化...");
 
-        // ===== ObjC Hook（constructor中立即执行 - 稳定）=====
+        // ===== Phase 1: ObjC Hook（constructor中立即执行，稳定）=====
         Class fmClass = objc_getClass("NSFileManager");
         if (fmClass) {
             Method m1 = class_getInstanceMethod(fmClass, @selector(fileExistsAtPath:));
@@ -273,12 +279,21 @@ static void AntiDetectInit() {
 
         clean_anticheat_defaults();
 
-        // ===== C函数Hook（延迟15秒，等游戏完全加载后）=====
-        // 关键：不能在constructor中调用MSHookFunction！
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            install_c_hooks();
+        // ===== Phase 2: +1秒 安装getenv/sysctl（轻量，始终激活）=====
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            install_env_hooks();
         });
 
-        NSLog(@"[AntiDetect] v16 ObjC Hook完成，C函数Hook将在15秒后安装");
+        // ===== Phase 3: +3秒 安装stat/access/dladdr（透传模式）=====
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            install_io_hooks_inactive();
+        });
+
+        // ===== Phase 4: +8秒 激活IO拦截 =====
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            activate_io_hooks();
+        });
+
+        NSLog(@"[AntiDetect] v17 Phase1完成 → +1s env hook → +3s IO hook(透传) → +8s 激活拦截");
     }
 }
