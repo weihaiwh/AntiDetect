@@ -8,6 +8,7 @@
 /*
  * AntiDetectDylib - iOS 环境检测绕过
  * 已预配置：TrollFools + LIBTOOL + CydiaSubstrate 环境
+ * 使用 Facebook fishhook 进行符号 hook
  * ⚠️ 此 dylib 必须是注入列表中【最后一个】加载的
  */
 
@@ -129,13 +130,12 @@ static intptr_t hooked_dyld_get_image_vmaddr_slide(uint32_t index) {
 
 #pragma mark - Hook: dladdr
 
-typedef struct { const char *dli_fname; void *dli_fbase; const char *dli_sname; void *dli_saddr; } Dl_info_type;
-static int (*orig_dladdr)(const void *, Dl_info_type *) = NULL;
+static int (*orig_dladdr)(const void *, Dl_info *) = NULL;
 
-static int hooked_dladdr(const void *addr, Dl_info_type *info) {
+static int hooked_dladdr(const void *addr, Dl_info *info) {
     int ret = orig_dladdr(addr, info);
     if (ret && info && info->dli_fname && should_hide_image(info->dli_fname)) {
-        memset(info, 0, sizeof(Dl_info_type));
+        memset(info, 0, sizeof(Dl_info));
         return 0;
     }
     return ret;
@@ -203,74 +203,154 @@ static BOOL hooked_canOpenURL(id self, SEL _cmd, NSURL *url) {
     return orig_canOpenURL(self, _cmd, url);
 }
 
-#pragma mark - fishhook 风格 rebind 实现
+#pragma mark - fishhook (Facebook) 内嵌实现
+// 来源: https://github.com/facebook/fishhook
+// BSD License - Copyright (c) Meta Platforms, Inc.
 
-typedef struct { const char *name; void *replacement; void **original; } Rebinding;
-static Rebinding g_rebindings[32];
-static int g_rebinding_count = 0;
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <mach-o/loader.h>
 
-static void add_rebinding(const char *name, void *replacement, void **original) {
-    if (g_rebinding_count >= 32) return;
-    g_rebindings[g_rebinding_count++] = (Rebinding){name, replacement, original};
+typedef struct {
+    const char *name;
+    void *replacement;
+    void **replaced;
+} fishhook_rebinding_t;
+
+static int fishhook_rebind_symbols(fishhook_rebinding_t rebindings[], size_t rebindings_nel);
+
+struct fishhook_rebindings_entry {
+    fishhook_rebinding_t *rebindings;
+    size_t rebindings_nel;
+    struct fishhook_rebindings_entry *next;
+};
+
+static struct fishhook_rebindings_entry *_fishhook_rebindings_head;
+
+static int fishhook_prepend_rebindings(fishhook_rebinding_t rebindings[],
+                                       size_t nel) {
+    struct fishhook_rebindings_entry *new_entry =
+        (struct fishhook_rebindings_entry *)malloc(sizeof(struct fishhook_rebindings_entry));
+    if (!new_entry) return -1;
+    new_entry->rebindings = rebindings;
+    new_entry->rebindings_nel = nel;
+    new_entry->next = _fishhook_rebindings_head;
+    _fishhook_rebindings_head = new_entry;
+    return 0;
 }
 
-static void rebind_symbols_for_image(struct mach_header_64 *header, intptr_t slide) {
-    uint8_t *base = (uint8_t *)header;
-    struct segment_command_64 *linkedit_seg = NULL;
-    struct dysymtab_command *dysymtab = NULL;
-
-    struct load_command *cmd = (struct load_command *)(base + sizeof(struct mach_header_64));
-    for (uint32_t i = 0; i < header->ncmds; i++) {
-        if (cmd->cmd == LC_SEGMENT_64) {
-            struct segment_command_64 *seg = (struct segment_command_64 *)cmd;
-            if (strcmp(seg->segname, "__LINKEDIT") == 0) linkedit_seg = seg;
-        } else if (cmd->cmd == LC_DYSYMTAB) {
-            dysymtab = (struct dysymtab_command *)cmd;
+static void fishhook_perform_rebinding_with_section(struct fishhook_rebindings_entry *rebindings,
+                                                     section_t *section,
+                                                     intptr_t slide,
+                                                     nlist_t *symtab,
+                                                     char *strtab,
+                                                     uint32_t *indirect_symtab) {
+    uint32_t *indirect_symbol_indices = indirect_symtab + section->reserved1;
+    void **indirect_symbol_bindings = (void **)((uintptr_t)slide + section->addr);
+    for (uint i = 0; i < section->size / sizeof(void *); i++) {
+        uint32_t symtab_index = indirect_symbol_indices[i];
+        if (symtab_index == INDIRECT_SYMBOL_ABS ||
+            symtab_index == INDIRECT_SYMBOL_LOCAL ||
+            symtab_index == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) {
+            continue;
         }
-        cmd = (struct load_command *)((uint8_t *)cmd + cmd->cmdsize);
-    }
-    if (!linkedit_seg || !dysymtab) return;
-
-    uintptr_t linkedit_base = slide + linkedit_seg->vmaddr;
-    const char *strtab = (const char *)(linkedit_base + dysymtab->strtaboff - linkedit_seg->fileoff);
-    struct nlist_64 *symtab = (struct nlist_64 *)(linkedit_base + dysymtab->symoff - linkedit_seg->fileoff);
-
-    cmd = (struct load_command *)(base + sizeof(struct mach_header_64));
-    for (uint32_t i = 0; i < header->ncmds; i++) {
-        if (cmd->cmd == LC_SEGMENT_64) {
-            struct segment_command_64 *seg = (struct segment_command_64 *)cmd;
-            struct section_64 *sect = (struct section_64 *)((uint8_t *)seg + sizeof(struct segment_command_64));
-            for (uint32_t j = 0; j < seg->nsects; j++) {
-                if (strcmp(sect->sectname, "__la_symbol_ptr") == 0 || strcmp(sect->sectname, "__nl_symbol_ptr") == 0) {
-                    uint32_t *indirect_sym = (uint32_t *)(linkedit_base + dysymtab->indirectsymoff - linkedit_seg->fileoff);
-                    void **symbol_ptr = (void **)(slide + sect->addr);
-                    for (uint32_t k = 0; k < sect->size / sizeof(void *); k++) {
-                        uint32_t sym_idx = indirect_sym[sect->reserved1 + k];
-                        if (sym_idx == INDIRECT_SYMBOL_ABS || sym_idx == INDIRECT_SYMBOL_LOCAL) continue;
-                        const char *sym_name = strtab + symtab[sym_idx].n_un.n_strx;
-                        for (int r = 0; r < g_rebinding_count; r++) {
-                            if (strcmp(sym_name + 1, g_rebindings[r].name) == 0) {
-                                if (g_rebindings[r].original) *(g_rebindings[r].original) = symbol_ptr[k];
-                                symbol_ptr[k] = g_rebindings[r].replacement;
-                            }
-                        }
+        uint32_t strtab_offset = symtab[symtab_index].n_un.n_strx;
+        char *symbol_name = strtab + strtab_offset;
+        bool symbol_name_longer_than_1 = symbol_name[0] && symbol_name[1];
+        struct fishhook_rebindings_entry *cur = rebindings;
+        while (cur) {
+            for (uint j = 0; j < cur->rebindings_nel; j++) {
+                if (symbol_name_longer_than_1 &&
+                    strcmp(&symbol_name[1], cur->rebindings[j].name) == 0) {
+                    if (cur->rebindings[j].replaced != NULL &&
+                        indirect_symbol_bindings[i] != cur->rebindings[j].replacement) {
+                        *(cur->rebindings[j].replaced) = indirect_symbol_bindings[i];
                     }
+                    indirect_symbol_bindings[i] = cur->rebindings[j].replacement;
+                    goto symbol_loop;
                 }
-                sect++;
+            }
+            cur = cur->next;
+        }
+    symbol_loop:;
+    }
+}
+
+static void fishhook_rebind_symbols_for_image(struct fishhook_rebindings_entry *rebindings,
+                                               const struct mach_header *header,
+                                               intptr_t slide) {
+    Dl_info info;
+    if (dladdr(header, &info) == 0) return;
+
+    segment_command_t *cur_seg_cmd;
+    segment_command_t *linkedit_segment = NULL;
+    struct symtab_command *symtab_cmd = NULL;
+    struct dysymtab_command *dysymtab_cmd = NULL;
+
+    uintptr_t cur = (uintptr_t)header + sizeof(struct mach_header);
+    for (uint i = 0; i < header->ncmds; i++, cur += cur_seg_cmd->cmdsize) {
+        cur_seg_cmd = (segment_command_t *)cur;
+        if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT) {
+            if (strcmp(cur_seg_cmd->segname, SEG_LINKEDIT) == 0) {
+                linkedit_segment = cur_seg_cmd;
+            }
+        } else if (cur_seg_cmd->cmd == LC_SYMTAB) {
+            symtab_cmd = (struct symtab_command *)cur_seg_cmd;
+        } else if (cur_seg_cmd->cmd == LC_DYSYMTAB) {
+            dysymtab_cmd = (struct dysymtab_command *)cur_seg_cmd;
+        }
+    }
+
+    if (!symtab_cmd || !dysymtab_cmd || !linkedit_segment) return;
+
+    uintptr_t linkedit_base = (uintptr_t)slide + linkedit_segment->vmaddr;
+    nlist_t *symtab = (nlist_t *)(linkedit_base + symtab_cmd->symoff);
+    char *strtab = (char *)(linkedit_base + symtab_cmd->stroff);
+    uint32_t *indirect_symtab = (uint32_t *)(linkedit_base + dysymtab_cmd->indirectsymoff);
+
+    cur = (uintptr_t)header + sizeof(struct mach_header);
+    for (uint i = 0; i < header->ncmds; i++, cur += cur_seg_cmd->cmdsize) {
+        cur_seg_cmd = (segment_command_t *)cur;
+        if (cur_seg_cmd->cmd != LC_SEGMENT_ARCH_DEPENDENT) continue;
+        if (strcmp(cur_seg_cmd->segname, SEG_DATA) != 0 &&
+            strcmp(cur_seg_cmd->segname, "__DATA_CONST") != 0) continue;
+        for (uint j = 0; j < cur_seg_cmd->nsects; j++) {
+            section_t *sect =
+                (section_t *)(cur + sizeof(segment_command_t)) + j;
+            if ((sect->flags & SECTION_TYPE) == S_LAZY_SYMBOL_POINTERS) {
+                fishhook_perform_rebinding_with_section(rebindings, sect, slide,
+                                                         symtab, strtab, indirect_symtab);
+            }
+            if ((sect->flags & SECTION_TYPE) == S_NON_LAZY_SYMBOL_POINTERS) {
+                fishhook_perform_rebinding_with_section(rebindings, sect, slide,
+                                                         symtab, strtab, indirect_symtab);
             }
         }
-        cmd = (struct load_command *)((uint8_t *)cmd + cmd->cmdsize);
     }
 }
 
-static void rebind_all_symbols() {
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (strstr(name, "/Application/") || strstr(name, "/var/containers/")) {
-            rebind_symbols_for_image((struct mach_header_64 *)_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
+static void _fishhook_rebind_symbols_for_image(const struct mach_header *header,
+                                                 intptr_t slide) {
+    fishhook_rebind_symbols_for_image(_fishhook_rebindings_head, header, slide);
+}
+
+static int fishhook_rebind_symbols(fishhook_rebinding_t rebindings[],
+                                   size_t rebindings_nel) {
+    int retval = fishhook_prepend_rebindings(rebindings, rebindings_nel);
+    if (retval < 0) return retval;
+
+    if (_fishhook_rebindings_head->next == NULL) {
+        _dyld_register_func_for_add_image(_fishhook_rebind_symbols_for_image);
+    } else {
+        uint32_t c = _dyld_image_count();
+        for (uint32_t i = 0; i < c; i++) {
+            fishhook_rebind_symbols_for_image(_fishhook_rebindings_head,
+                                               _dyld_get_image_header(i),
+                                               _dyld_get_image_vmaddr_slide(i));
         }
     }
+    return retval;
 }
 
 #pragma mark - 入口点
@@ -310,16 +390,19 @@ static void AntiDetectInit() {
         @"/var/mobile/Containers/Data/Application/",
     ];
 
-    add_rebinding("_dyld_image_count", hooked_dyld_image_count, (void **)&orig_dyld_image_count);
-    add_rebinding("_dyld_get_image_name", hooked_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
-    add_rebinding("_dyld_get_image_header", hooked_dyld_get_image_header, (void **)&orig_dyld_get_image_header);
-    add_rebinding("_dyld_get_image_vmaddr_slide", hooked_dyld_get_image_vmaddr_slide, (void **)&orig_dyld_get_image_vmaddr_slide);
-    add_rebinding("dladdr", hooked_dladdr, (void **)&orig_dladdr);
-    add_rebinding("getenv", hooked_getenv, (void **)&orig_getenv);
-    add_rebinding("sysctl", hooked_sysctl, (void **)&orig_sysctl);
+    // 使用 fishhook rebind 符号
+    fishhook_rebinding_t rebindings[] = {
+        {"_dyld_image_count", hooked_dyld_image_count, (void **)&orig_dyld_image_count},
+        {"_dyld_get_image_name", hooked_dyld_get_image_name, (void **)&orig_dyld_get_image_name},
+        {"_dyld_get_image_header", hooked_dyld_get_image_header, (void **)&orig_dyld_get_image_header},
+        {"_dyld_get_image_vmaddr_slide", hooked_dyld_get_image_vmaddr_slide, (void **)&orig_dyld_get_image_vmaddr_slide},
+        {"dladdr", hooked_dladdr, (void **)&orig_dladdr},
+        {"getenv", hooked_getenv, (void **)&orig_getenv},
+        {"sysctl", hooked_sysctl, (void **)&orig_sysctl},
+    };
+    fishhook_rebind_symbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
 
-    rebind_all_symbols();
-
+    // ObjC Method Swizzling
     Class fmClass = objc_getClass("NSFileManager");
     if (fmClass) {
         orig_fileExistsAtPath = (void *)class_replaceMethod(fmClass, @selector(fileExistsAtPath:), (IMP)hooked_fileExistsAtPath, "B@:@");
