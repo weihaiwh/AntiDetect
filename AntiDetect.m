@@ -203,9 +203,10 @@ static BOOL hooked_canOpenURL(id self, SEL _cmd, NSURL *url) {
     return orig_canOpenURL(self, _cmd, url);
 }
 
-#pragma mark - fishhook (Facebook) 内嵌实现
+#pragma mark - fishhook (Facebook) 内嵌实现 - 全部使用显式 64 位类型
 // 来源: https://github.com/facebook/fishhook
 // BSD License - Copyright (c) Meta Platforms, Inc.
+// 已将 section_t/nlist_t/segment_command_t 全部替换为显式的 _64 类型
 
 #include <stdlib.h>
 #include <string.h>
@@ -216,36 +217,35 @@ typedef struct {
     const char *name;
     void *replacement;
     void **replaced;
-} fishhook_rebinding_t;
+} fh_rebinding_t;
 
-static int fishhook_rebind_symbols(fishhook_rebinding_t rebindings[], size_t rebindings_nel);
+static int fh_rebind_symbols(fh_rebinding_t rebindings[], size_t rebindings_nel);
 
-struct fishhook_rebindings_entry {
-    fishhook_rebinding_t *rebindings;
+struct fh_rebindings_entry {
+    fh_rebinding_t *rebindings;
     size_t rebindings_nel;
-    struct fishhook_rebindings_entry *next;
+    struct fh_rebindings_entry *next;
 };
 
-static struct fishhook_rebindings_entry *_fishhook_rebindings_head;
+static struct fh_rebindings_entry *_fh_rebindings_head;
 
-static int fishhook_prepend_rebindings(fishhook_rebinding_t rebindings[],
-                                       size_t nel) {
-    struct fishhook_rebindings_entry *new_entry =
-        (struct fishhook_rebindings_entry *)malloc(sizeof(struct fishhook_rebindings_entry));
+static int fh_prepend_rebindings(fh_rebinding_t rebindings[], size_t nel) {
+    struct fh_rebindings_entry *new_entry =
+        (struct fh_rebindings_entry *)malloc(sizeof(struct fh_rebindings_entry));
     if (!new_entry) return -1;
     new_entry->rebindings = rebindings;
     new_entry->rebindings_nel = nel;
-    new_entry->next = _fishhook_rebindings_head;
-    _fishhook_rebindings_head = new_entry;
+    new_entry->next = _fh_rebindings_head;
+    _fh_rebindings_head = new_entry;
     return 0;
 }
 
-static void fishhook_perform_rebinding_with_section(struct fishhook_rebindings_entry *rebindings,
-                                                     section_t *section,
-                                                     intptr_t slide,
-                                                     nlist_t *symtab,
-                                                     char *strtab,
-                                                     uint32_t *indirect_symtab) {
+static void fh_perform_rebinding_with_section(struct fh_rebindings_entry *rebindings,
+                                              struct section_64 *section,
+                                              intptr_t slide,
+                                              struct nlist_64 *symtab,
+                                              char *strtab,
+                                              uint32_t *indirect_symtab) {
     uint32_t *indirect_symbol_indices = indirect_symtab + section->reserved1;
     void **indirect_symbol_bindings = (void **)((uintptr_t)slide + section->addr);
     for (uint i = 0; i < section->size / sizeof(void *); i++) {
@@ -258,7 +258,7 @@ static void fishhook_perform_rebinding_with_section(struct fishhook_rebindings_e
         uint32_t strtab_offset = symtab[symtab_index].n_un.n_strx;
         char *symbol_name = strtab + strtab_offset;
         bool symbol_name_longer_than_1 = symbol_name[0] && symbol_name[1];
-        struct fishhook_rebindings_entry *cur = rebindings;
+        struct fh_rebindings_entry *cur = rebindings;
         while (cur) {
             for (uint j = 0; j < cur->rebindings_nel; j++) {
                 if (symbol_name_longer_than_1 &&
@@ -277,21 +277,21 @@ static void fishhook_perform_rebinding_with_section(struct fishhook_rebindings_e
     }
 }
 
-static void fishhook_rebind_symbols_for_image(struct fishhook_rebindings_entry *rebindings,
-                                               const struct mach_header *header,
-                                               intptr_t slide) {
+static void fh_rebind_symbols_for_image(struct fh_rebindings_entry *rebindings,
+                                         const struct mach_header *header,
+                                         intptr_t slide) {
     Dl_info info;
     if (dladdr(header, &info) == 0) return;
 
-    segment_command_t *cur_seg_cmd;
-    segment_command_t *linkedit_segment = NULL;
+    struct segment_command_64 *cur_seg_cmd;
+    struct segment_command_64 *linkedit_segment = NULL;
     struct symtab_command *symtab_cmd = NULL;
     struct dysymtab_command *dysymtab_cmd = NULL;
 
-    uintptr_t cur = (uintptr_t)header + sizeof(struct mach_header);
+    uintptr_t cur = (uintptr_t)header + sizeof(struct mach_header_64);
     for (uint i = 0; i < header->ncmds; i++, cur += cur_seg_cmd->cmdsize) {
-        cur_seg_cmd = (segment_command_t *)cur;
-        if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT) {
+        cur_seg_cmd = (struct segment_command_64 *)cur;
+        if (cur_seg_cmd->cmd == LC_SEGMENT_64) {
             if (strcmp(cur_seg_cmd->segname, SEG_LINKEDIT) == 0) {
                 linkedit_segment = cur_seg_cmd;
             }
@@ -305,49 +305,48 @@ static void fishhook_rebind_symbols_for_image(struct fishhook_rebindings_entry *
     if (!symtab_cmd || !dysymtab_cmd || !linkedit_segment) return;
 
     uintptr_t linkedit_base = (uintptr_t)slide + linkedit_segment->vmaddr;
-    nlist_t *symtab = (nlist_t *)(linkedit_base + symtab_cmd->symoff);
+    struct nlist_64 *symtab = (struct nlist_64 *)(linkedit_base + symtab_cmd->symoff);
     char *strtab = (char *)(linkedit_base + symtab_cmd->stroff);
     uint32_t *indirect_symtab = (uint32_t *)(linkedit_base + dysymtab_cmd->indirectsymoff);
 
-    cur = (uintptr_t)header + sizeof(struct mach_header);
+    cur = (uintptr_t)header + sizeof(struct mach_header_64);
     for (uint i = 0; i < header->ncmds; i++, cur += cur_seg_cmd->cmdsize) {
-        cur_seg_cmd = (segment_command_t *)cur;
-        if (cur_seg_cmd->cmd != LC_SEGMENT_ARCH_DEPENDENT) continue;
+        cur_seg_cmd = (struct segment_command_64 *)cur;
+        if (cur_seg_cmd->cmd != LC_SEGMENT_64) continue;
         if (strcmp(cur_seg_cmd->segname, SEG_DATA) != 0 &&
             strcmp(cur_seg_cmd->segname, "__DATA_CONST") != 0) continue;
         for (uint j = 0; j < cur_seg_cmd->nsects; j++) {
-            section_t *sect =
-                (section_t *)(cur + sizeof(segment_command_t)) + j;
+            struct section_64 *sect =
+                (struct section_64 *)((uintptr_t)cur_seg_cmd + sizeof(struct segment_command_64)) + j;
             if ((sect->flags & SECTION_TYPE) == S_LAZY_SYMBOL_POINTERS) {
-                fishhook_perform_rebinding_with_section(rebindings, sect, slide,
-                                                         symtab, strtab, indirect_symtab);
+                fh_perform_rebinding_with_section(rebindings, sect, slide,
+                                                   symtab, strtab, indirect_symtab);
             }
             if ((sect->flags & SECTION_TYPE) == S_NON_LAZY_SYMBOL_POINTERS) {
-                fishhook_perform_rebinding_with_section(rebindings, sect, slide,
-                                                         symtab, strtab, indirect_symtab);
+                fh_perform_rebinding_with_section(rebindings, sect, slide,
+                                                   symtab, strtab, indirect_symtab);
             }
         }
     }
 }
 
-static void _fishhook_rebind_symbols_for_image(const struct mach_header *header,
-                                                 intptr_t slide) {
-    fishhook_rebind_symbols_for_image(_fishhook_rebindings_head, header, slide);
+static void _fh_rebind_symbols_for_image(const struct mach_header *header,
+                                          intptr_t slide) {
+    fh_rebind_symbols_for_image(_fh_rebindings_head, header, slide);
 }
 
-static int fishhook_rebind_symbols(fishhook_rebinding_t rebindings[],
-                                   size_t rebindings_nel) {
-    int retval = fishhook_prepend_rebindings(rebindings, rebindings_nel);
+static int fh_rebind_symbols(fh_rebinding_t rebindings[], size_t rebindings_nel) {
+    int retval = fh_prepend_rebindings(rebindings, rebindings_nel);
     if (retval < 0) return retval;
 
-    if (_fishhook_rebindings_head->next == NULL) {
-        _dyld_register_func_for_add_image(_fishhook_rebind_symbols_for_image);
+    if (_fh_rebindings_head->next == NULL) {
+        _dyld_register_func_for_add_image(_fh_rebind_symbols_for_image);
     } else {
         uint32_t c = _dyld_image_count();
         for (uint32_t i = 0; i < c; i++) {
-            fishhook_rebind_symbols_for_image(_fishhook_rebindings_head,
-                                               _dyld_get_image_header(i),
-                                               _dyld_get_image_vmaddr_slide(i));
+            fh_rebind_symbols_for_image(_fh_rebindings_head,
+                                         _dyld_get_image_header(i),
+                                         _dyld_get_image_vmaddr_slide(i));
         }
     }
     return retval;
@@ -391,7 +390,7 @@ static void AntiDetectInit() {
     ];
 
     // 使用 fishhook rebind 符号
-    fishhook_rebinding_t rebindings[] = {
+    fh_rebinding_t rebindings[] = {
         {"_dyld_image_count", hooked_dyld_image_count, (void **)&orig_dyld_image_count},
         {"_dyld_get_image_name", hooked_dyld_get_image_name, (void **)&orig_dyld_get_image_name},
         {"_dyld_get_image_header", hooked_dyld_get_image_header, (void **)&orig_dyld_get_image_header},
@@ -400,7 +399,7 @@ static void AntiDetectInit() {
         {"getenv", hooked_getenv, (void **)&orig_getenv},
         {"sysctl", hooked_sysctl, (void **)&orig_sysctl},
     };
-    fishhook_rebind_symbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
+    fh_rebind_symbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
 
     // ObjC Method Swizzling
     Class fmClass = objc_getClass("NSFileManager");
