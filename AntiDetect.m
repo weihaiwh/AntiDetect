@@ -4,6 +4,7 @@
 #import <mach-o/dyld_images.h>
 #import <mach/mach.h>
 #import <mach/task_info.h>
+#import <mach/mach_time.h>
 #import <UIKit/UIKit.h>
 #import <sys/stat.h>
 #import <dirent.h>
@@ -12,6 +13,9 @@
 #import <stdlib.h>
 #import <pthread.h>
 #import "fishhook.h"
+
+// _dyld_get_all_image_infos 不是公开API，需要手动声明
+extern const struct dyld_all_image_infos* _dyld_get_all_image_infos(void);
 
 /*
  * AntiDetectDylib v23 - 直接修改dyld共享内存 + fishhook + ObjC
