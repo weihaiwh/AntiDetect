@@ -14,8 +14,26 @@
 #import <pthread.h>
 #import "fishhook.h"
 
-// _dyld_get_all_image_infos 不是公开API，需要手动声明
-extern const struct dyld_all_image_infos* _dyld_get_all_image_infos(void);
+// _dyld_get_all_image_infos 不是公开API，需要通过task_info获取
+static struct dyld_all_image_infos *get_dyld_all_image_infos() {
+    // 方式1: 通过task_info获取地址
+    task_dyld_info_data_t dyld_info;
+    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+    kern_return_t ret = task_info(mach_task_self(), TASK_DYLD_INFO,
+                                  (task_info_t)&dyld_info, &count);
+    if (ret == KERN_SUCCESS && dyld_info.all_image_info_addr) {
+        return (struct dyld_all_image_infos *)(uintptr_t)dyld_info.all_image_info_addr;
+    }
+
+    // 方式2: 通过dlsym查找（备用）
+    typedef const struct dyld_all_image_infos *(*GetAllImageInfosFunc)(void);
+    GetAllImageInfosFunc func = (GetAllImageInfosFunc)dlsym(RTLD_DEFAULT, "_dyld_get_all_image_infos");
+    if (func) {
+        return (struct dyld_all_image_infos *)func();
+    }
+
+    return NULL;
+}
 
 /*
  * AntiDetectDylib v23 - 直接修改dyld共享内存 + fishhook + ObjC
@@ -76,7 +94,7 @@ static volatile BOOL g_keep_polling = YES;
 
 static void patch_dyld_image_infos() {
     // 获取 dyld_all_image_infos 结构体地址
-    struct dyld_all_image_infos *infos = (struct dyld_all_image_infos *)_dyld_get_all_image_infos();
+    struct dyld_all_image_infos *infos = get_dyld_all_image_infos();
     if (!infos) {
         NSLog(@"[AntiDetect] _dyld_get_all_image_infos 返回NULL");
         return;
