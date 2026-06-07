@@ -212,6 +212,7 @@ static BOOL hooked_canOpenURL(id self, SEL _cmd, NSURL *url) {
 #include <string.h>
 #include <stdint.h>
 #include <mach-o/loader.h>
+#include <mach-o/nlist.h>
 
 typedef struct {
     const char *name;
