@@ -12,19 +12,27 @@ jobs:
 
       - name: Build AntiDetect.dylib
         run: |
-          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null)
+          
+          if [ -z "$SDK_PATH" ]; then
+            echo "ERROR: iOS SDK not found!"
+            find /Applications/Xcode.app -name "iPhoneOS.sdk" -type d 2>/dev/null
+            exit 1
+          fi
+          
+          echo "Using SDK: $SDK_PATH"
+          
           # 编译 .m 为 .o
-          clang \
+          xcrun clang \
             -arch arm64 \
             -isysroot "$SDK_PATH" \
             -miphoneos-version-min=14.0 \
             -fobjc-arc \
             -c AntiDetect.m \
             -o AntiDetect.o
-
+          
           # 链接为 dylib
-          clang \
+          xcrun clang \
             -arch arm64 \
             -isysroot "$SDK_PATH" \
             -miphoneos-version-min=14.0 \
@@ -35,7 +43,7 @@ jobs:
             -lobjc \
             -o AntiDetect.dylib \
             AntiDetect.o
-
+          
           rm -f AntiDetect.o
 
       - name: Verify
