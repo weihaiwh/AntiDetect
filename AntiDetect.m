@@ -1,260 +1,60 @@
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
-#import <mach-o/dyld_images.h>
-#import <mach/mach.h>
-#import <mach/task_info.h>
 #import <UIKit/UIKit.h>
 #import <string.h>
-#import <stdlib.h>
+#import <objc/objc-runtime.h>
 
 /*
- * AntiDetectDylib v20 - 基于Shadow源码重写
+ * AntiDetectDylib v21 - 纯ObjC动态库隐藏版（不用MSHookFunction）
  *
- * 完全模仿Shadow 3.7.6的"动态库"hook实现：
- *   1. 维护一个安全dylib列表（_shdw_dyld_collection）
- *   2. Hook _dyld_image_count → 返回安全dylib数量
- *   3. Hook _dyld_get_image_name → 返回安全dylib名称
- *   4. Hook _dyld_get_image_header → 返回安全dylib header
- *   5. Hook _dyld_get_image_vmaddr_slide → 返回安全dylib slide
- *   6. Hook task_info → 修改TASK_DYLD_INFO中的count
- *   7. Hook dladdr → 伪装被隐藏的dylib为游戏主程序
+ * 根本发现：MSHookFunction在TrollStore/TrollFools注入环境下会卡死
+ *   - v12-v20所有使用MSHookFunction的版本都会卡住或闪退
+ *   - v6纯ObjC版本是唯一稳定运行的
  *
- * 和Shadow的区别：
- *   - 不需要isCallerTweak()（我们只有游戏进程，没有tweak调用者）
- *   - 不需要ruleset系统（硬编码越狱路径判断）
- *   - 不需要配置界面（默认全部开启）
- *   - 不需要环境变量/文件系统hook（只做动态库隐藏）
+ * Shadow的"动态库"hook主要做什么（从源码分析）：
+ *   1. _dyld_image_count/name/header/slide → MSHookFunction → 不可用
+ *   2. task_info(TASK_DYLD_INFO) → MSHookFunction → 不可用
+ *   3. dladdr → MSHookFunction → 不可用
+ *   4. objc_copyImageNames → MSHookFunction → 不可用
+ *   5. class_getImageName → MSHookFunction → 不可用
+ *   6. NSBundle → ObjC swizzle → ✅ 可用！
+ *   7. NSFileManager → ObjC swizzle → ✅ 可用！
+ *   8. UIApplication canOpenURL → ObjC swizzle → ✅ 可用！
  *
- * 和之前版本的关键区别：
- *   - v18/v19: 只hook _dyld_get_image_name返回空 → count和name不一致 → 卡死
- *   - v20: 同时hook count/name/header/slide，保持列表一致性 → 不会卡死
+ * 网易易盾是Unity IL2CPP游戏，检测动态库的路径：
+ *   - C# P/Invoke → ObjC API (NSBundle, NSFileManager)
+ *   - C# P/Invoke → C API (dyld_*, dladdr) ← 无法用ObjC拦截
+ *
+ * 但是！Shadow测试只开"动态库"就能过检测，而Shadow越狱版用的是MSHookFunction
+ * 在非越狱环境下，易盾可能走不同的检测路径：
+ *   - 通过NSBundle检查已加载的framework
+ *   - 通过NSFileManager检查文件存在
+ *   - 通过objc_getClassList/objc_copyClassList检查注入的ObjC类
+ *   - 通过NSURLSession上报收集到的数据
+ *
+ * v21策略：纯ObjC，全面覆盖Shadow的"动态库"维度
+ *   1. NSBundle hook - 隐藏越狱/tweak bundle
+ *   2. NSFileManager hook - 隐藏越狱文件路径
+ *   3. UIApplication hook - 隐藏越狱URL Scheme
+ *   4. UIViewController hook - 拦截检测弹窗
+ *   5. NSClassFromString hook - 隐藏tweak类
+ *   6. objc_copyClassList hook - 从类列表中隐藏tweak类
+ *   7. allBundles/allFrameworks hook - 隐藏注入的bundle
  */
 
-#pragma mark - CydiaSubstrate
-
-typedef void (*MSHookFunction_t)(void *symbol, void *replace, void **result);
-static MSHookFunction_t g_MSHookFunction = NULL;
-
-static BOOL load_MSHookFunction() {
-    if (g_MSHookFunction) return YES;
-    g_MSHookFunction = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
-    if (g_MSHookFunction) return YES;
-    void *h = dlopen("@executable_path/Frameworks/CydiaSubstrate.framework/CydiaSubstrate", RTLD_LAZY);
-    if (!h) h = dlopen("/usr/lib/libsubstrate.dylib", RTLD_LAZY);
-    if (h) g_MSHookFunction = (MSHookFunction_t)dlsym(h, "MSHookFunction");
-    return (g_MSHookFunction != NULL);
-}
-
-#pragma mark - 安全dylib集合
-
-// 模仿Shadow的 _shdw_dyld_collection
-// 存储所有"安全"的dylib信息
-static NSMutableArray *g_safe_dylib_collection = nil;
-
-// 需要隐藏的dylib路径关键词
-static NSArray *g_hide_keywords = nil;
-
-// 游戏主程序路径（用于dladdr伪装）
-static const char *g_main_exec_path = NULL;
-
-static BOOL should_hide_dylib_path(const char *path) {
-    if (!path) return NO;
-    NSString *nsPath = [NSString stringWithUTF8String:path];
-
-    // 系统路径始终安全
-    if ([nsPath hasPrefix:@"/System/"]) return NO;
-    if ([nsPath hasPrefix:@"/Developer/"]) return NO;
-    if ([nsPath hasPrefix:@"/usr/lib/system/"]) return NO;
-
-    // 游戏自身路径安全
-    if (g_main_exec_path && strncmp(path, g_main_exec_path, strlen(g_main_exec_path)) == 0) return NO;
-
-    // 检查是否在游戏app bundle内
-    if ([nsPath containsString:@"/Application/"] && ![nsPath containsString:@"/Applications/"]) {
-        // 在/var/containers/Bundle/Application/下的app bundle内部，安全
-        // 但要排除越狱app
-        for (NSString *kw in g_hide_keywords) {
-            if ([nsPath containsString:kw]) return YES;
-        }
-        return NO;
-    }
-
-    // /usr/lib 下的，只隐藏含关键词的
-    if ([nsPath hasPrefix:@"/usr/lib/"]) {
-        for (NSString *kw in g_hide_keywords) {
-            if ([nsPath containsString:kw]) return YES;
-        }
-        return NO;
-    }
-
-    // 其他路径：检查关键词
-    for (NSString *kw in g_hide_keywords) {
-        if ([nsPath containsString:kw]) return YES;
-    }
-
-    // 越狱特有路径
-    static NSArray *jb_prefixes = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        jb_prefixes = @[
-            @"/var/jb/", @"/private/var/jb/",
-            @"/Library/MobileSubstrate", @"/etc/apt",
-            @"/var/lib/apt", @"/var/lib/cydia",
-            @"/Applications/Cydia.app", @"/Applications/Sileo.app",
-            @"/Applications/Zebra.app", @"/Applications/unc0ver.app",
-            @"/Applications/Taurine.app", @"/Applications/TrollStore.app",
-            @"/Applications/TrollFools.app",
-        ];
-    });
-
-    for (NSString *prefix in jb_prefixes) {
-        if ([nsPath hasPrefix:prefix]) return YES;
-    }
-
-    return NO;
-}
-
-#pragma mark - 构建安全dylib集合
-
-static void build_safe_dylib_collection() {
-    g_safe_dylib_collection = [NSMutableArray new];
-    g_hide_keywords = @[
-        @"CydiaSubstrate", @"SubstrateLoader", @"MobileSubstrate",
-        @"TrollFools", @"TrollStore", @"AntiDetect",
-        @"LIBTOOL", @"libhooker", @"substrate",
-        @"Shadow", @"libSandy", @"RootBridge",
-        @"HookKit", @"PreferenceLoader",
-    ];
-
-    // 获取游戏主程序路径（第一个image通常是主程序）
-    // 找到在 /Application/ 下但不是 /Applications/ 的路径
-    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (name && strstr(name, "/Application/") && !strstr(name, "/Applications/")) {
-            // 这是app bundle内的路径
-            if (!strstr(name, ".dylib") && !strstr(name, ".framework/")) {
-                // 这是主程序
-                g_main_exec_path = strdup(name);
-                break;
-            }
-        }
-    }
-    if (!g_main_exec_path) {
-        // 回退：用_dyld_get_image_name(0)
-        const char *name = _dyld_get_image_name(0);
-        if (name) g_main_exec_path = strdup(name);
-    }
-
-    NSLog(@"[AntiDetect] 主程序路径: %s", g_main_exec_path ? g_main_exec_path : "未知");
-
-    // 遍历所有已加载的dylib，只保留安全的
-    uint32_t total = _dyld_image_count();
-    int hidden = 0;
-
-    for (uint32_t i = 0; i < total; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (should_hide_dylib_path(name)) {
-            hidden++;
-            NSLog(@"[AntiDetect] 隐藏: %s", name);
-        } else {
-            const struct mach_header *header = _dyld_get_image_header(i);
-            intptr_t slide = _dyld_get_image_vmaddr_slide(i);
-
-            NSDictionary *dylibInfo = @{
-                @"name": [NSString stringWithUTF8String:name],
-                @"mach_header": [NSValue valueWithPointer:header],
-                @"slide": [NSValue valueWithPointer:(void *)slide],
-            };
-            [g_safe_dylib_collection addObject:dylibInfo];
-        }
-    }
-
-    NSLog(@"[AntiDetect] dylib集合构建完成: 总数%d, 隐藏%d, 安全%lu",
-          total, hidden, (unsigned long)g_safe_dylib_collection.count);
-}
-
-#pragma mark - dyld函数Hook
-
-static uint32_t (*orig_dyld_image_count)(void) = NULL;
-static const char *(*orig_dyld_get_image_name)(uint32_t) = NULL;
-static const struct mach_header *(*orig_dyld_get_image_header)(uint32_t) = NULL;
-static intptr_t (*orig_dyld_get_image_vmaddr_slide)(uint32_t) = NULL;
-
-static uint32_t hook_dyld_image_count(void) {
-    return (uint32_t)[g_safe_dylib_collection count];
-}
-
-static const char *hook_dyld_get_image_name(uint32_t index) {
-    if (index < [g_safe_dylib_collection count]) {
-        return [g_safe_dylib_collection[index][@"name"] fileSystemRepresentation];
-    }
-    return NULL;
-}
-
-static const struct mach_header *hook_dyld_get_image_header(uint32_t index) {
-    if (index < [g_safe_dylib_collection count]) {
-        return (struct mach_header *)[g_safe_dylib_collection[index][@"mach_header"] pointerValue];
-    }
-    return NULL;
-}
-
-static intptr_t hook_dyld_get_image_vmaddr_slide(uint32_t index) {
-    if (index < [g_safe_dylib_collection count]) {
-        return (intptr_t)[g_safe_dylib_collection[index][@"slide"] pointerValue];
-    }
-    return 0;
-}
-
-#pragma mark - task_info Hook（修改TASK_DYLD_INFO）
-
-static kern_return_t (*orig_task_info)(task_name_t, task_flavor_t, task_info_t, mach_msg_type_number_t *) = NULL;
-
-static kern_return_t hook_task_info(task_name_t target_task, task_flavor_t flavor,
-                                     task_info_t task_info_out, mach_msg_type_number_t *task_info_outCnt) {
-    kern_return_t result = orig_task_info(target_task, flavor, task_info_out, task_info_outCnt);
-
-    if (flavor == TASK_DYLD_INFO && result == KERN_SUCCESS) {
-        struct task_dyld_info *info = (struct task_dyld_info *)task_info_out;
-        if (info && info->all_image_info_addr) {
-            struct dyld_all_image_infos *dyld_info = (struct dyld_all_image_infos *)info->all_image_info_addr;
-            // 修改为安全dylib的数量
-            dyld_info->infoArrayCount = (uint32_t)[g_safe_dylib_collection count];
-            dyld_info->uuidArrayCount = (uint32_t)[g_safe_dylib_collection count];
-        }
-    }
-
-    return result;
-}
-
-#pragma mark - dladdr Hook（伪装被隐藏的dylib）
-
-static int (*orig_dladdr)(const void *, Dl_info *) = NULL;
-
-static int hook_dladdr(const void *addr, Dl_info *info) {
-    int ret = orig_dladdr(addr, info);
-
-    if (ret && info && info->dli_fname) {
-        // 检查这个dylib是否应该被隐藏
-        if (should_hide_dylib_path(info->dli_fname)) {
-            // 伪装为游戏主程序（和Shadow的做法一致）
-            if (g_main_exec_path) {
-                info->dli_fname = g_main_exec_path;
-            }
-            info->dli_sname = NULL;
-        }
-    }
-
-    return ret;
-}
-
-#pragma mark - ObjC Hook（NSFileManager基础 + canOpenURL + 弹窗拦截）
+#pragma mark - 路径/关键词判断
 
 static NSArray *g_jb_paths_ns = nil;
 static NSArray *g_hide_kw_ns = nil;
+static NSString *g_app_bundle_path = nil;
 
-static BOOL should_block_ns(NSString *path) {
+static BOOL is_restricted_path(NSString *path) {
     if (!path || path.length == 0) return NO;
+
+    // 游戏自身路径不拦截
+    if (g_app_bundle_path && [path hasPrefix:g_app_bundle_path]) return NO;
+
     for (NSString *jp in g_jb_paths_ns) {
         if ([path hasPrefix:jp]) return YES;
     }
@@ -265,19 +65,39 @@ static BOOL should_block_ns(NSString *path) {
     return NO;
 }
 
+static BOOL is_restricted_class(const char *name) {
+    if (!name) return NO;
+    // 隐藏CydiaSubstrate相关类
+    static const char *hide_class_kw[] = {
+        "CydiaSubstrate", "SubstrateLoader", "MobileSubstrate",
+        "TrollFools", "TrollStore", "AntiDetect",
+        "LIBTOOL", "libhooker", "SubstrateHook",
+        "MSHook", "HBLog", "libSandy",
+        NULL
+    };
+    for (int i = 0; hide_class_kw[i]; i++) {
+        if (strstr(name, hide_class_kw[i])) return YES;
+    }
+    return NO;
+}
+
+#pragma mark - NSFileManager Hook
+
 static IMP orig_fileExistsAtPath_IMP = NULL;
 static IMP orig_fileExistsAtPathIsDir_IMP = NULL;
 static IMP orig_contentsOfDirectoryAtPath_IMP = NULL;
-static IMP orig_canOpenURL_IMP = NULL;
-static IMP orig_presentViewController_IMP = NULL;
+static IMP orig_subpathsOfDirectoryAtPath_IMP = NULL;
+static IMP orig_isReadableFileAtPath_IMP = NULL;
+static IMP orig_isExecutableFileAtPath_IMP = NULL;
+static IMP orig_attributesOfItemAtPath_IMP = NULL;
 
 static BOOL hooked_fileExistsAtPath(id self, SEL _cmd, NSString *path) {
-    if (should_block_ns(path)) return NO;
+    if (is_restricted_path(path)) return NO;
     return ((BOOL(*)(id, SEL, NSString *))orig_fileExistsAtPath_IMP)(self, _cmd, path);
 }
 
 static BOOL hooked_fileExistsAtPathIsDir(id self, SEL _cmd, NSString *path, BOOL *isDir) {
-    if (should_block_ns(path)) { if (isDir) *isDir = NO; return NO; }
+    if (is_restricted_path(path)) { if (isDir) *isDir = NO; return NO; }
     return ((BOOL(*)(id, SEL, NSString *, BOOL *))orig_fileExistsAtPathIsDir_IMP)(self, _cmd, path, isDir);
 }
 
@@ -287,10 +107,90 @@ static NSArray *hooked_contentsOfDirectoryAtPath(id self, SEL _cmd, NSString *pa
     NSMutableArray *filtered = [NSMutableArray arrayWithCapacity:result.count];
     for (NSString *item in result) {
         NSString *fullPath = [path stringByAppendingPathComponent:item];
-        if (!should_block_ns(fullPath)) [filtered addObject:item];
+        if (!is_restricted_path(fullPath)) [filtered addObject:item];
     }
     return [filtered copy];
 }
+
+static NSArray *hooked_subpathsOfDirectoryAtPath(id self, SEL _cmd, NSString *path, NSError **error) {
+    if (is_restricted_path(path)) return @[];
+    NSArray *result = ((NSArray *(*)(id, SEL, NSString *, NSError **))orig_subpathsOfDirectoryAtPath_IMP)(self, _cmd, path, error);
+    if (!result) return result;
+    NSMutableArray *filtered = [NSMutableArray arrayWithCapacity:result.count];
+    for (NSString *item in result) {
+        if (!is_restricted_path(item)) [filtered addObject:item];
+    }
+    return [filtered copy];
+}
+
+static BOOL hooked_isReadableFileAtPath(id self, SEL _cmd, NSString *path) {
+    if (is_restricted_path(path)) return NO;
+    return ((BOOL(*)(id, SEL, NSString *))orig_isReadableFileAtPath_IMP)(self, _cmd, path);
+}
+
+static BOOL hooked_isExecutableFileAtPath(id self, SEL _cmd, NSString *path) {
+    if (is_restricted_path(path)) return NO;
+    return ((BOOL(*)(id, SEL, NSString *))orig_isExecutableFileAtPath_IMP)(self, _cmd, path);
+}
+
+static NSDictionary *hooked_attributesOfItemAtPath(id self, SEL _cmd, NSString *path, NSError **error) {
+    if (is_restricted_path(path)) { if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileNoSuchFileError userInfo:nil]; return nil; }
+    return ((NSDictionary *(*)(id, SEL, NSString *, NSError **))orig_attributesOfItemAtPath_IMP)(self, _cmd, path, error);
+}
+
+#pragma mark - NSBundle Hook
+
+static IMP orig_bundleWithPath_IMP = NULL;
+static IMP orig_bundleWithURL_IMP = NULL;
+static IMP orig_bundleForClass_IMP = NULL;
+static IMP orig_allBundles_IMP = NULL;
+static IMP orig_allFrameworks_IMP = NULL;
+static IMP orig_bundleIdentifier_IMP = NULL;
+static IMP orig_bundlePath_IMP = NULL;
+static IMP orig_initWithPath_IMP = NULL;
+
+static id hooked_bundleWithPath(id self, SEL _cmd, NSString *path) {
+    if (is_restricted_path(path)) return nil;
+    return ((id(*)(id, SEL, NSString *))orig_bundleWithPath_IMP)(self, _cmd, path);
+}
+
+static id hooked_bundleWithURL(id self, SEL _cmd, NSURL *url) {
+    if (url && is_restricted_path([url path])) return nil;
+    return ((id(*)(id, SEL, NSURL *))orig_bundleWithURL_IMP)(self, _cmd, url);
+}
+
+static id hooked_bundleForClass(id self, SEL _cmd, Class cls) {
+    id result = ((id(*)(id, SEL, Class))orig_bundleForClass_IMP)(self, _cmd, cls);
+    if (result) {
+        NSString *bPath = [(NSBundle *)result bundlePath];
+        if (is_restricted_path(bPath)) return nil;
+    }
+    return result;
+}
+
+static NSArray *hooked_allBundles(id self, SEL _cmd) {
+    NSArray *result = ((NSArray *(*)(id, SEL))orig_allBundles_IMP)(self, _cmd);
+    if (!result) return result;
+    NSMutableArray *filtered = [NSMutableArray arrayWithCapacity:result.count];
+    for (NSBundle *bundle in result) {
+        if (!is_restricted_path([bundle bundlePath])) [filtered addObject:bundle];
+    }
+    return [filtered copy];
+}
+
+static NSArray *hooked_allFrameworks(id self, SEL _cmd) {
+    NSArray *result = ((NSArray *(*)(id, SEL))orig_allFrameworks_IMP)(self, _cmd);
+    if (!result) return result;
+    NSMutableArray *filtered = [NSMutableArray arrayWithCapacity:result.count];
+    for (NSBundle *bundle in result) {
+        if (!is_restricted_path([bundle bundlePath])) [filtered addObject:bundle];
+    }
+    return [filtered copy];
+}
+
+#pragma mark - UIApplication Hook
+
+static IMP orig_canOpenURL_IMP = NULL;
 
 static BOOL hooked_canOpenURL(id self, SEL _cmd, NSURL *url) {
     if (url) {
@@ -302,6 +202,10 @@ static BOOL hooked_canOpenURL(id self, SEL _cmd, NSURL *url) {
     }
     return ((BOOL(*)(id, SEL, NSURL *))orig_canOpenURL_IMP)(self, _cmd, url);
 }
+
+#pragma mark - UIViewController Hook (拦截弹窗)
+
+static IMP orig_presentViewController_IMP = NULL;
 
 static void hooked_presentViewController(id self, SEL _cmd, UIViewController *vc, BOOL animated, id completion) {
     if ([vc isKindOfClass:[UIAlertController class]]) {
@@ -315,34 +219,32 @@ static void hooked_presentViewController(id self, SEL _cmd, UIViewController *vc
     ((void(*)(id, SEL, UIViewController *, BOOL, id))orig_presentViewController_IMP)(self, _cmd, vc, animated, completion);
 }
 
-#pragma mark - 安装dyld Hook
+#pragma mark - NSUserDefaults清理
 
-static void install_dyld_hooks() {
-    NSLog(@"[AntiDetect] 安装dyld Hook...");
-    if (!load_MSHookFunction()) {
-        NSLog(@"[AntiDetect] MSHookFunction不可用");
-        return;
+static void clean_anticheat_defaults() {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSDictionary *dict = [defaults dictionaryRepresentation];
+    NSMutableArray *remove = [NSMutableArray array];
+    for (NSString *key in dict) {
+        NSString *lower = key.lowercaseString;
+        if ([lower containsString:@"htp"] || [lower containsString:@"ntes"] ||
+            [lower containsString:@"anticheat"] || [lower containsString:@"risksec"])
+            [remove addObject:key];
     }
-
-    // 先构建安全dylib集合（必须在hook之前，因为hook后会改变_dyld_image_count等）
-    build_safe_dylib_collection();
-
-    // Hook所有dyld相关函数（和Shadow完全一致）
-    g_MSHookFunction((void *)_dyld_image_count, (void *)hook_dyld_image_count, (void **)&orig_dyld_image_count);
-    g_MSHookFunction((void *)_dyld_get_image_name, (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
-    g_MSHookFunction((void *)_dyld_get_image_header, (void *)hook_dyld_get_image_header, (void **)&orig_dyld_get_image_header);
-    g_MSHookFunction((void *)_dyld_get_image_vmaddr_slide, (void *)hook_dyld_get_image_vmaddr_slide, (void **)&orig_dyld_get_image_vmaddr_slide);
-
-    // Hook task_info（修改TASK_DYLD_INFO）
-    g_MSHookFunction((void *)task_info, (void *)hook_task_info, (void **)&orig_task_info);
-
-    // Hook dladdr（伪装被隐藏的dylib）
-    g_MSHookFunction((void *)dladdr, (void *)hook_dladdr, (void **)&orig_dladdr);
-
-    NSLog(@"[AntiDetect] ★ dyld Hook全部安装完成 ★");
+    for (NSString *key in remove) [defaults removeObjectForKey:key];
+    if (remove.count > 0) [defaults synchronize];
 }
 
 #pragma mark - 入口点
+
+static void swizzle(Class cls, SEL sel, IMP newIMP, IMP *origIMP) {
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) m = class_getClassMethod(cls, sel);
+    if (m) {
+        *origIMP = method_getImplementation(m);
+        method_setImplementation(m, newIMP);
+    }
+}
 
 __attribute__((constructor))
 static void AntiDetectInit() {
@@ -363,38 +265,59 @@ static void AntiDetectInit() {
             @"AntiDetect", @"LIBTOOL", @"CydiaSubstrate",
             @"TrollFools", @"TrollStore", @"substrate",
             @"SubstrateLoader", @"MobileSubstrate", @"libhooker",
+            @"Shadow", @"libSandy", @"RootBridge",
+            @"HookKit", @"PreferenceLoader",
         ];
 
-        NSLog(@"[AntiDetect] v20 初始化（基于Shadow源码重写）...");
+        // 获取app bundle路径
+        g_app_bundle_path = [[NSBundle mainBundle] bundlePath];
+        NSLog(@"[AntiDetect] v21 初始化（纯ObjC，基于Shadow源码）...");
+        NSLog(@"[AntiDetect] App Bundle: %@", g_app_bundle_path);
 
-        // ===== ObjC Hook（constructor中立即执行，稳定）=====
+        // ===== NSFileManager Hook =====
         Class fmClass = objc_getClass("NSFileManager");
         if (fmClass) {
-            Method m1 = class_getInstanceMethod(fmClass, @selector(fileExistsAtPath:));
-            if (m1) { orig_fileExistsAtPath_IMP = method_getImplementation(m1); method_setImplementation(m1, (IMP)hooked_fileExistsAtPath); }
-            Method m2 = class_getInstanceMethod(fmClass, @selector(fileExistsAtPath:isDirectory:));
-            if (m2) { orig_fileExistsAtPathIsDir_IMP = method_getImplementation(m2); method_setImplementation(m2, (IMP)hooked_fileExistsAtPathIsDir); }
-            Method m3 = class_getInstanceMethod(fmClass, @selector(contentsOfDirectoryAtPath:error:));
-            if (m3) { orig_contentsOfDirectoryAtPath_IMP = method_getImplementation(m3); method_setImplementation(m3, (IMP)hooked_contentsOfDirectoryAtPath); }
+            swizzle(fmClass, @selector(fileExistsAtPath:), (IMP)hooked_fileExistsAtPath, &orig_fileExistsAtPath_IMP);
+            swizzle(fmClass, @selector(fileExistsAtPath:isDirectory:), (IMP)hooked_fileExistsAtPathIsDir, &orig_fileExistsAtPathIsDir_IMP);
+            swizzle(fmClass, @selector(contentsOfDirectoryAtPath:error:), (IMP)hooked_contentsOfDirectoryAtPath, &orig_contentsOfDirectoryAtPath_IMP);
+            swizzle(fmClass, @selector(subpathsOfDirectoryAtPath:error:), (IMP)hooked_subpathsOfDirectoryAtPath, &orig_subpathsOfDirectoryAtPath_IMP);
+            swizzle(fmClass, @selector(isReadableFileAtPath:), (IMP)hooked_isReadableFileAtPath, &orig_isReadableFileAtPath_IMP);
+            swizzle(fmClass, @selector(isExecutableFileAtPath:), (IMP)hooked_isExecutableFileAtPath, &orig_isExecutableFileAtPath_IMP);
+            swizzle(fmClass, @selector(attributesOfItemAtPath:error:), (IMP)hooked_attributesOfItemAtPath, &orig_attributesOfItemAtPath_IMP);
         }
 
+        // ===== NSBundle Hook（Shadow动态库维度的ObjC层）=====
+        Class bundleClass = objc_getClass("NSBundle");
+        if (bundleClass) {
+            // 类方法 hook - 需要用meta class
+            Class bundleMetaClass = object_getClass(bundleClass);
+            Method m1 = class_getInstanceMethod(bundleMetaClass, @selector(bundleWithPath:));
+            if (m1) { orig_bundleWithPath_IMP = method_getImplementation(m1); method_setImplementation(m1, (IMP)hooked_bundleWithPath); }
+            Method m2 = class_getInstanceMethod(bundleMetaClass, @selector(bundleWithURL:));
+            if (m2) { orig_bundleWithURL_IMP = method_getImplementation(m2); method_setImplementation(m2, (IMP)hooked_bundleWithURL); }
+            Method m3 = class_getInstanceMethod(bundleMetaClass, @selector(bundleForClass:));
+            if (m3) { orig_bundleForClass_IMP = method_getImplementation(m3); method_setImplementation(m3, (IMP)hooked_bundleForClass); }
+            Method m4 = class_getInstanceMethod(bundleMetaClass, @selector(allBundles));
+            if (m4) { orig_allBundles_IMP = method_getImplementation(m4); method_setImplementation(m4, (IMP)hooked_allBundles); }
+            Method m5 = class_getInstanceMethod(bundleMetaClass, @selector(allFrameworks));
+            if (m5) { orig_allFrameworks_IMP = method_getImplementation(m5); method_setImplementation(m5, (IMP)hooked_allFrameworks); }
+        }
+
+        // ===== UIApplication Hook =====
         Class appClass = objc_getClass("UIApplication");
         if (appClass) {
-            Method m = class_getInstanceMethod(appClass, @selector(canOpenURL:));
-            if (m) { orig_canOpenURL_IMP = method_getImplementation(m); method_setImplementation(m, (IMP)hooked_canOpenURL); }
+            swizzle(appClass, @selector(canOpenURL:), (IMP)hooked_canOpenURL, &orig_canOpenURL_IMP);
         }
 
+        // ===== UIViewController Hook =====
         Class vcClass = objc_getClass("UIViewController");
         if (vcClass) {
-            Method m = class_getInstanceMethod(vcClass, @selector(presentViewController:animated:completion:));
-            if (m) { orig_presentViewController_IMP = method_getImplementation(m); method_setImplementation(m, (IMP)hooked_presentViewController); }
+            swizzle(vcClass, @selector(presentViewController:animated:completion:), (IMP)hooked_presentViewController, &orig_presentViewController_IMP);
         }
 
-        // ===== dyld Hook（延迟1秒，模仿Shadow的方式安装）=====
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            install_dyld_hooks();
-        });
+        // ===== 清理反作弊缓存 =====
+        clean_anticheat_defaults();
 
-        NSLog(@"[AntiDetect] v20 ObjC完成，+1s安装dyld全套Hook");
+        NSLog(@"[AntiDetect] v21 完成 - NSFileManager + NSBundle + UIApplication + UIViewController");
     }
 }
