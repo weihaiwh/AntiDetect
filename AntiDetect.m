@@ -3,6 +3,7 @@
 #import <mach-o/dyld.h>
 #import <UIKit/UIKit.h>
 #import <sys/stat.h>
+#import <dirent.h>
 #import <string.h>
 #import <stdio.h>
 #import <stdlib.h>
