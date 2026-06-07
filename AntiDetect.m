@@ -3,7 +3,6 @@
 #import <mach-o/dyld.h>
 #import <UIKit/UIKit.h>
 #import <string.h>
-#import <objc/objc-runtime.h>
 
 /*
  * AntiDetectDylib v21 - 纯ObjC动态库隐藏版（不用MSHookFunction）
