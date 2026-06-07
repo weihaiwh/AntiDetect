@@ -9,22 +9,40 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Build AntiDetect.dylib
         run: |
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+
+          # 编译 .m 为 .o
           clang \
             -arch arm64 \
-            -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
-            -target arm64-apple-ios14.0 \
+            -isysroot "$SDK_PATH" \
             -miphoneos-version-min=14.0 \
-            -shared \
             -fobjc-arc \
+            -c AntiDetect.m \
+            -o AntiDetect.o
+
+          # 链接为 dylib
+          clang \
+            -arch arm64 \
+            -isysroot "$SDK_PATH" \
+            -miphoneos-version-min=14.0 \
+            -dynamiclib \
             -framework Foundation \
             -framework UIKit \
             -framework CoreFoundation \
+            -lobjc \
             -o AntiDetect.dylib \
-            AntiDetect.m
-      
+            AntiDetect.o
+
+          rm -f AntiDetect.o
+
+      - name: Verify
+        run: |
+          file AntiDetect.dylib
+          ls -lh AntiDetect.dylib
+
       - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
