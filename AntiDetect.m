@@ -187,21 +187,21 @@ static uint32_t hook_dyld_image_count(void) {
 
 static const char *hook_dyld_get_image_name(uint32_t index) {
     if (index < [g_safe_dylib_collection count]) {
-        return [[g_safe_dylib_collection[index][@"name"] fileSystemRepresentation] UTF8String];
+        return [g_safe_dylib_collection[index][@"name"] fileSystemRepresentation];
     }
     return NULL;
 }
 
 static const struct mach_header *hook_dyld_get_image_header(uint32_t index) {
     if (index < [g_safe_dylib_collection count]) {
-        return (struct mach_header *)[[g_safe_dylib_collection[index][@"mach_header"] pointerValue]];
+        return (struct mach_header *)[g_safe_dylib_collection[index][@"mach_header"] pointerValue];
     }
     return NULL;
 }
 
 static intptr_t hook_dyld_get_image_vmaddr_slide(uint32_t index) {
     if (index < [g_safe_dylib_collection count]) {
-        return (intptr_t)[[g_safe_dylib_collection[index][@"slide"] pointerValue]];
+        return (intptr_t)[g_safe_dylib_collection[index][@"slide"] pointerValue];
     }
     return 0;
 }
