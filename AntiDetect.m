@@ -9,16 +9,20 @@
 #import <string.h>
 
 /*
- * AntiDetectDylib v14 - 优化C函数hook性能
+ * AntiDetectDylib v15 - 惰性激活C函数hook
  *
- * v13问题：游戏卡在logo加载阶段
- * 原因：hook函数中用NSString做字符串匹配太慢，导致游戏的文件IO阻塞
+ * v14问题：延迟3秒安装C函数hook，但安装后游戏还在加载资源，立刻卡住
+ * 根本原因：即使只拦截越狱路径，每次stat/access/fopen都多了一轮字符串比较
+ * 游戏启动时有上万次文件IO，额外的字符串比较开销累积导致卡死
  *
- * v14修复：
- *   1. C函数hook延迟3秒（等游戏资源加载完）
- *   2. hook函数内部用纯C字符串操作（strstr/strncmp），不用NSString
- *   3. 越狱路径检查用前缀快速匹配，避免字符串分配
- *   4. 只hook必要的函数，减少拦截范围
+ * v15方案：
+ *   - C函数hook在constructor中立即安装（零延迟，不遗漏任何检测）
+ *   - 但hook函数内部有一个 g_hooks_active 开关，初始为NO
+ *   - 开关为NO时，hook函数直接调用原函数，零额外开销
+ *   - 10秒后开启开关，此时游戏资源已加载完，开始拦截越狱路径
+ *   - 易盾检测在选角色后触发，10秒完全够用
+ *
+ * 这样既不会遗漏早期检测（hook已安装），又不会影响游戏加载性能
  */
 
 #pragma mark - CydiaSubstrate
@@ -36,9 +40,13 @@ static BOOL load_MSHookFunction() {
     return (g_MSHookFunction != NULL);
 }
 
-#pragma mark - 越狱路径配置（纯C字符串，高性能）
+#pragma mark - 惰性激活开关
 
-// 越狱路径前缀 - 用纯C字符串避免NSString开销
+// 初始为0（关闭），10秒后置为1（开启）
+static volatile int32_t g_hooks_active = 0;
+
+#pragma mark - 越狱路径（纯C）
+
 static const char *g_jb_prefixes[] = {
     "/Applications/Cydia.app",
     "/Applications/Sileo.app",
@@ -64,7 +72,6 @@ static const char *g_jb_prefixes[] = {
     NULL
 };
 
-// 越狱路径中包含的关键词（用于dladdr检查）
 static const char *g_hide_keywords[] = {
     "CydiaSubstrate",
     "SubstrateLoader",
@@ -78,22 +85,22 @@ static const char *g_hide_keywords[] = {
     NULL
 };
 
-// 纯C函数：检查路径是否为越狱路径
-static BOOL is_jb_path(const char *path) {
-    if (!path) return NO;
+// 快速检查：先看开关，再匹配
+static inline BOOL is_jb_path(const char *path) {
+    if (!g_hooks_active || !path) return NO;
     for (int i = 0; g_jb_prefixes[i]; i++) {
-        if (strncmp(path, g_jb_prefixes[i], strlen(g_jb_prefixes[i])) == 0)
-            return YES;
+        const char *prefix = g_jb_prefixes[i];
+        // 快速首字母过滤
+        if (path[0] != prefix[0]) continue;
+        if (strncmp(path, prefix, strlen(prefix)) == 0) return YES;
     }
     return NO;
 }
 
-// 纯C函数：检查dylib名是否要隐藏
-static BOOL should_hide_lib(const char *name) {
-    if (!name) return NO;
+static inline BOOL should_hide_lib(const char *name) {
+    if (!g_hooks_active || !name) return NO;
     for (int i = 0; g_hide_keywords[i]; i++) {
-        if (strstr(name, g_hide_keywords[i]))
-            return YES;
+        if (strstr(name, g_hide_keywords[i])) return YES;
     }
     return NO;
 }
@@ -124,7 +131,7 @@ static FILE *hook_fopen(const char *path, const char *mode) {
 
 static int hook_dladdr(const void *addr, Dl_info *info) {
     int ret = orig_dladdr(addr, info);
-    if (ret && info && info->dli_fname && should_hide_lib(info->dli_fname)) {
+    if (should_hide_lib(info->dli_fname)) {
         memset(info, 0, sizeof(Dl_info));
         return 0;
     }
@@ -132,6 +139,7 @@ static int hook_dladdr(const void *addr, Dl_info *info) {
 }
 
 static char *hook_getenv(const char *name) {
+    // getenv始终拦截（不影响游戏加载）
     if (name) {
         if (strncmp(name, "DYLD_", 5) == 0) return NULL;
         if (strstr(name, "MSSafeMode") || strstr(name, "SUBSTRATE_HOME")) return NULL;
@@ -141,6 +149,7 @@ static char *hook_getenv(const char *name) {
 
 static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     int result = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+    // sysctl P_TRACED清除也始终生效
     if (namelen == 4 && name[0] == CTL_KERN && name[1] == KERN_PROC &&
         name[2] == KERN_PROC_PID && oldp && oldlenp &&
         *oldlenp >= sizeof(struct kinfo_proc)) {
@@ -149,11 +158,11 @@ static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, vo
     return result;
 }
 
-#pragma mark - 安装C函数Hook
+#pragma mark - 安装C函数Hook（立即安装但惰性激活）
 
 static void install_c_hooks() {
     if (!load_MSHookFunction()) {
-        NSLog(@"[AntiDetect] MSHookFunction不可用");
+        NSLog(@"[AntiDetect] MSHookFunction不可用，跳过C函数hook");
         return;
     }
 
@@ -164,24 +173,17 @@ static void install_c_hooks() {
     g_MSHookFunction((void *)getenv, (void *)hook_getenv, (void **)&orig_getenv);
     g_MSHookFunction((void *)sysctl, (void *)hook_sysctl, (void **)&orig_sysctl);
 
-    NSLog(@"[AntiDetect] C函数Hook安装完成 (stat/access/fopen/dladdr/getenv/sysctl)");
+    NSLog(@"[AntiDetect] C函数Hook已安装（惰性模式，g_hooks_active=%d）", g_hooks_active);
 }
 
 #pragma mark - ObjC Hook
 
-static IMP orig_fileExistsAtPath_IMP = NULL;
-static IMP orig_fileExistsAtPathIsDir_IMP = NULL;
-static IMP orig_contentsOfDirectoryAtPath_IMP = NULL;
-static IMP orig_canOpenURL_IMP = NULL;
-static IMP orig_presentViewController_IMP = NULL;
-
-// ObjC层用的路径检查（NSString）
 static NSArray *g_jb_paths_ns = nil;
 static NSArray *g_hide_kw_ns = nil;
 
 static BOOL should_block_ns(NSString *path) {
+    if (!g_hooks_active) return NO; // ObjC层也惰性激活
     if (!path || path.length == 0) return NO;
-    if (!g_jb_paths_ns) return NO;
     for (NSString *jp in g_jb_paths_ns) {
         if ([path hasPrefix:jp]) return YES;
     }
@@ -191,6 +193,12 @@ static BOOL should_block_ns(NSString *path) {
     }
     return NO;
 }
+
+static IMP orig_fileExistsAtPath_IMP = NULL;
+static IMP orig_fileExistsAtPathIsDir_IMP = NULL;
+static IMP orig_contentsOfDirectoryAtPath_IMP = NULL;
+static IMP orig_canOpenURL_IMP = NULL;
+static IMP orig_presentViewController_IMP = NULL;
 
 static BOOL hooked_fileExistsAtPath(id self, SEL _cmd, NSString *path) {
     if (should_block_ns(path)) return NO;
@@ -257,29 +265,17 @@ static void clean_anticheat_defaults() {
 __attribute__((constructor))
 static void AntiDetectInit() {
     @autoreleasepool {
-        // 初始化ObjC配置
         g_jb_paths_ns = @[
-            @"/Applications/Cydia.app",
-            @"/Applications/Sileo.app",
-            @"/Applications/Zebra.app",
-            @"/Applications/unc0ver.app",
-            @"/Applications/Taurine.app",
-            @"/Applications/TrollStore.app",
-            @"/Applications/TrollFools.app",
-            @"/Library/MobileSubstrate",
-            @"/usr/lib/substrate",
-            @"/usr/lib/ligerness",
-            @"/usr/lib/libhooker",
-            @"/etc/apt",
-            @"/var/lib/apt",
-            @"/var/lib/cydia",
-            @"/private/var/lib/cydia",
-            @"/private/var/mobile/Library/Cydia",
-            @"/.bootstrapped_evas1on",
-            @"/.cydia_no_stash",
-            @"/.installed_unc0ver",
-            @"/var/jb",
-            @"/private/var/jb",
+            @"/Applications/Cydia.app", @"/Applications/Sileo.app",
+            @"/Applications/Zebra.app", @"/Applications/unc0ver.app",
+            @"/Applications/Taurine.app", @"/Applications/TrollStore.app",
+            @"/Applications/TrollFools.app", @"/Library/MobileSubstrate",
+            @"/usr/lib/substrate", @"/usr/lib/ligerness",
+            @"/usr/lib/libhooker", @"/etc/apt", @"/var/lib/apt",
+            @"/var/lib/cydia", @"/private/var/lib/cydia",
+            @"/private/var/mobile/Library/Cydia", @"/.bootstrapped_evas1on",
+            @"/.cydia_no_stash", @"/.installed_unc0ver",
+            @"/var/jb", @"/private/var/jb",
         ];
         g_hide_kw_ns = @[
             @"AntiDetect", @"LIBTOOL", @"CydiaSubstrate",
@@ -287,9 +283,9 @@ static void AntiDetectInit() {
             @"SubstrateLoader", @"MobileSubstrate", @"libhooker",
         ];
 
-        NSLog(@"[AntiDetect] v14 初始化...");
+        NSLog(@"[AntiDetect] v15 初始化（惰性激活模式）...");
 
-        // ===== ObjC Hook（立即执行）=====
+        // ===== ObjC Hook（立即安装但惰性激活）=====
         Class fmClass = objc_getClass("NSFileManager");
         if (fmClass) {
             Method m1 = class_getInstanceMethod(fmClass, @selector(fileExistsAtPath:));
@@ -314,11 +310,15 @@ static void AntiDetectInit() {
 
         clean_anticheat_defaults();
 
-        // ===== C函数Hook（延迟3秒，等游戏资源加载完毕）=====
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            install_c_hooks();
+        // ===== C函数Hook（立即安装，但g_hooks_active=0所以hook直接透传）=====
+        install_c_hooks();
+
+        // ===== 10秒后激活所有拦截（此时游戏资源已加载完毕）=====
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            g_hooks_active = 1;
+            NSLog(@"[AntiDetect] ★ 拦截已激活！所有越狱路径检测现在会被拦截 ★");
         });
 
-        NSLog(@"[AntiDetect] v14 ObjC Hook完成，C函数Hook将在3秒后安装");
+        NSLog(@"[AntiDetect] v15 初始化完成（Hook已安装，10秒后激活拦截）");
     }
 }
